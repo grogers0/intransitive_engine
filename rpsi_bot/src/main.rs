@@ -2,14 +2,29 @@ use std::collections::HashSet;
 use std::io::{self, Write};
 use std::time::Duration;
 
-use engine_core::{Move, Position, Player, search};
+use engine_core::{Move, Position, Player, search, tt};
+
+const HASH_OPTION_PREFIX: &str = "setoption name Hash value ";
 
 fn main() {
+    let tt_max_size_mb: usize = 128_000; // TODO - set this limit based on system memory?
     let mut position = Position::initial();
+    let mut tt = tt::TranspositionTable::new(tt::DEFAULT_TT_SIZE_MB);
     for line in io::stdin().lines().map(|line| line.unwrap()) {
         match line.as_str() {
             s if s.starts_with("setoption ") => {
-                // TODO if we implement options
+                if s.starts_with(HASH_OPTION_PREFIX) {
+                    if let Ok(size_mb) = s[HASH_OPTION_PREFIX.len()..].parse::<usize>() {
+                        tt.resize(size_mb);
+                        eprintln!("resized transposition table to {} MB", size_mb);
+                    } else {
+                        println!("info string ignored incorrectly formatted option: {}", s);
+                        eprintln!("ignored incorrectly formatted option: {}", s);
+                    }
+                } else {
+                    println!("info string ignored unknown option: {}", s);
+                    eprintln!("ignored unknown option: {}", s);
+                }
             },
             s if s.starts_with("position ") => {
                 position = Position::parse_rpsi_position(&line);
@@ -18,8 +33,9 @@ fn main() {
             s if s.starts_with("go ") => {
                 let search_opts = parse_search_opts(position.active_player, &line);
                 // TODO - nodes?
+                tt.next_search();
                 let best_move = search::best_move(&mut position, search_opts.depth,
-                    search_opts.soft_deadline, search_opts.hard_deadline).unwrap();
+                    search_opts.soft_deadline, search_opts.hard_deadline, &mut tt).unwrap();
                 println!("bestmove {}", best_move);
             },
             "rpsi" => {
@@ -27,9 +43,12 @@ fn main() {
                 println!("id author Greg Rogers");
                 // TODO - id version <git_hash>?
                 // TODO - options? These seem to be the ones from UCI:
-                //     Hash: Sets the size of the transposition table in megabytes.
                 //     MultiPV: Tells the engine to output multiple principal variations (lines of analysis) at the same time.
                 //     Ponder: Enables the engine to think ahead on the opponent's expected time (background calculation).
+
+                // Transposition table size in MB
+                println!("option name Hash type spin default {} min 1 max {}",
+                    tt::DEFAULT_TT_SIZE_MB, tt_max_size_mb);
                 println!("protocol 1");
                 println!("rules 2");
                 println!("mode V6 Intransitive");
@@ -38,7 +57,7 @@ fn main() {
             "isready" => println!("readyok"),
             "newgame V6" => {
                 position = Position::initial();
-                // TODO - we would reset the transposition table here when it's implemented
+                tt.clear();
             },
             "stop" => {
                 // TODO - interrupt searching and emit the best move

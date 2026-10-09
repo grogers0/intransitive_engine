@@ -17,19 +17,21 @@ i.e. delta_x = to_x + 1 - from_x
 */
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub struct CompactMove([u8; 2]);
+pub struct CompactMove(pub u16);
 
 impl From<Move> for CompactMove {
     fn from(m: Move) -> CompactMove {
-        let mut ret = CompactMove([0u8; 2]);
-        ret.0[0] |= m.from_x;
-        ret.0[0] |= m.from_y << 4;
+        let mut ret = CompactMove(0);
+        debug_assert!(m.from_x < 9);
+        debug_assert!(m.from_y < 9);
+        ret.0 |= m.from_x as u16;
+        ret.0 |= (m.from_y as u16) << 4;
         debug_assert!(m.to_x + 1 - m.from_x <= 2);
         debug_assert!(m.to_y + 1 - m.from_y <= 2);
-        ret.0[1] |= m.to_x + 1 - m.from_x;
-        ret.0[1] |= (m.to_y + 1 - m.from_y) << 2;
+        ret.0 |= ((m.to_x + 1 - m.from_x) as u16) << 8;
+        ret.0 |= ((m.to_y + 1 - m.from_y) as u16) << 10;
         if m.is_capture {
-            ret.0[1] |= 1 << 4;
+            ret.0 |= 1 << 12;
         }
         ret
     }
@@ -37,11 +39,11 @@ impl From<Move> for CompactMove {
 
 impl From<CompactMove> for Move {
     fn from(cm: CompactMove) -> Move {
-        let from_x = cm.0[0] & 0x0f;
-        let from_y = cm.0[0] >> 4;
-        let to_x = from_x + (cm.0[1] & 0x03) - 1;
-        let to_y = from_y + ((cm.0[1] >> 2) & 0x03) - 1;
-        let is_capture = (cm.0[1] & 0x10) != 0;
+        let from_x = (cm.0 as u8) & 0x0f;
+        let from_y = ((cm.0 >> 4) as u8) & 0x0f;
+        let to_x = from_x + (((cm.0 >> 8) as u8) & 0x03) - 1;
+        let to_y = from_y + (((cm.0 >> 10) as u8) & 0x03) - 1;
+        let is_capture = (((cm.0 >> 12) as u8) & 0x01) != 0;
         Move { from_x, from_y, to_x, to_y, is_capture }
     }
 }
@@ -61,6 +63,7 @@ mod tests {
 
                 for to_x in min_x..=max_x {
                     for to_y in min_y..=max_y {
+                        if to_x == from_x && to_y == from_y { continue; }
                         for is_capture in [false, true] {
                             check_round_trip(Move { from_x, from_y, to_x, to_y, is_capture });
                         }

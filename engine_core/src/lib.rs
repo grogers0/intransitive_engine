@@ -4,6 +4,8 @@ pub mod heuristic;
 pub mod moves;
 pub mod position;
 pub mod search;
+pub mod tt;
+pub mod value;
 pub mod zobrist;
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug, Hash)]
@@ -16,13 +18,6 @@ impl Player {
         match self {
             Player::Blue => Player::Red,
             Player::Red => Player::Blue,
-        }
-    }
-
-    pub fn sign(&self) -> i16 {
-        match self {
-            Player::Blue => 1,
-            Player::Red => -1,
         }
     }
 }
@@ -47,5 +42,7 @@ pub enum Outcome {
     Draw, Win(Player),
 }
 
+pub use value::{Value, MAX_PLY};
 pub use position::Position;
 pub use moves::Move;
+pub use tt::TranspositionTable;
