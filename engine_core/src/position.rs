@@ -192,24 +192,20 @@ impl<'a> Iterator for LegalMoves<'a> {
 impl Position {
     pub fn initial() -> Position {
         let mut board = Board::new();
-        let mut zobrist = ZobristAccumulator::new();
-        let mut set_cell = |x: u8, y: u8, player: Player, piece: Piece| {
-            *board.get_mut(x, y) = Cell::Occupied(player, piece);
-            zobrist.xor_piece(x, y, player, piece);
-        };
         for i in 0..3 {
-            set_cell(1 + i, 3 - i, Player::Blue, Piece::Rock);
-            set_cell(1 + i, 4 - i, Player::Blue, Piece::Paper);
-            set_cell(2 + i, 4 - i, Player::Blue, Piece::Scissors);
-            set_cell(5 + i, 7 - i, Player::Red, Piece::Rock);
-            set_cell(4 + i, 7 - i, Player::Red, Piece::Paper);
-            set_cell(4 + i, 6 - i, Player::Red, Piece::Scissors);
+            *board.get_mut(1 + i, 3 - i) = Cell::Occupied(Player::Blue, Piece::Rock);
+            *board.get_mut(1 + i, 4 - i) = Cell::Occupied(Player::Blue, Piece::Paper);
+            *board.get_mut(2 + i, 4 - i) = Cell::Occupied(Player::Blue, Piece::Scissors);
+            *board.get_mut(5 + i, 7 - i) = Cell::Occupied(Player::Red, Piece::Rock);
+            *board.get_mut(4 + i, 7 - i) = Cell::Occupied(Player::Red, Piece::Paper);
+            *board.get_mut(4 + i, 6 - i) = Cell::Occupied(Player::Red, Piece::Scissors);
         }
-        set_cell(4, 1, Player::Blue, Piece::Paper);
-        set_cell(7, 4, Player::Red, Piece::Paper);
+        *board.get_mut(4, 1) = Cell::Occupied(Player::Blue, Piece::Paper);
+        *board.get_mut(7, 4) = Cell::Occupied(Player::Red, Piece::Paper);
 
         let active_player = Player::Blue;
         let plies_since_capture = 0;
+        let zobrist = Self::fill_zobrist(&board, active_player);
         Position { board, active_player, plies_since_capture, zobrist }
     }
 
@@ -217,24 +213,14 @@ impl Position {
         let mut tokens = s.split(' ');
         assert!(tokens.next().unwrap() == "position");
         assert!(tokens.next().unwrap() == "fen");
-        let mut zobrist = ZobristAccumulator::new();
         let board = Board::from_fen(tokens.next().unwrap());
-        for y in 0..9 {
-            for x in 0..9 {
-                if let Cell::Occupied(player, piece) = board.get(x, y) {
-                    zobrist.xor_piece(x, y, player, piece);
-                }
-            }
-        }
         let active_player = match tokens.next().unwrap() {
             "b" => Player::Blue,
-            "r" => {
-                zobrist.xor_player();
-                Player::Red
-            },
+            "r" => Player::Red,
             ch => panic!("Invalid active player '{}'", ch),
         };
         tokens.next().unwrap(); // Skip territory for intransitive
+        let zobrist = Self::fill_zobrist(&board, active_player);
 
         let mut position = Position { board, active_player, plies_since_capture: 0, zobrist };
 
@@ -250,6 +236,21 @@ impl Position {
 
         position
     }
+
+    pub fn from_fen(s: &str) -> Position {
+        let mut tokens = s.split(' ');
+        let board = Board::from_fen(tokens.next().unwrap());
+        let active_player = match tokens.next().unwrap() {
+            "b" => Player::Blue,
+            "r" => Player::Red,
+            ch => panic!("Invalid active player '{}'", ch),
+        };
+        assert!(tokens.next().is_none());
+        let zobrist = Self::fill_zobrist(&board, active_player);
+
+        Position { board, active_player, plies_since_capture: 0, zobrist }
+    }
+
 
     pub fn legal_moves(&self) -> LegalMoves<'_> {
         LegalMoves { position: &self, x: 0, y: 0, i: 0 }
@@ -342,6 +343,21 @@ impl Position {
 
             *self.board.get_mut(x, y) = cell;
         }
+    }
+
+    fn fill_zobrist(board: &Board, active_player: Player) -> ZobristAccumulator {
+        let mut zobrist = ZobristAccumulator::new();
+        for y in 0..9 {
+            for x in 0..9 {
+                if let Cell::Occupied(player, piece) = board.get(x, y) {
+                    zobrist.xor_piece(x, y, player, piece);
+                }
+            }
+        }
+        if active_player == Player::Red {
+            zobrist.xor_player();
+        }
+        zobrist
     }
 }
 

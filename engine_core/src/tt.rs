@@ -8,7 +8,7 @@ use crate::Value;
 
 pub const DEFAULT_TT_SIZE_MB: usize = 100;
 
-const CLUSTER_SIZE: usize = 3;
+const CLUSTER_SIZE: usize = 4;
 const GENERATION_BITS: usize = 5;
 const GENERATION_MASK: u8 = (1 << GENERATION_BITS) - 1;
 
@@ -43,7 +43,7 @@ pub struct TTData {
     pub value: Value,
 }
 
-#[derive(Clone)]
+#[derive(Copy, Clone)]
 struct TTEntry {
     key: u16,
     depth: u8,
@@ -80,7 +80,7 @@ impl TTEntry {
     }
 
     fn generations_ago(&self, curr_generation: u8) -> u8 {
-        (curr_generation - self.misc) & GENERATION_MASK
+        curr_generation.wrapping_sub(self.misc) & GENERATION_MASK
     }
 }
 
@@ -92,12 +92,12 @@ struct Cluster {
 
 impl Cluster {
     fn zero() -> Cluster {
-        Cluster { entries: [TTEntry::zero(), TTEntry::zero(), TTEntry::zero()] }
+        Cluster { entries: [TTEntry::zero(); CLUSTER_SIZE] }
     }
 }
 
 pub struct TranspositionTable {
-    pub generation: u8,
+    generation: u8,
     num_clusters: usize,
     clusters: Box<[Cluster]>,
 }
@@ -128,6 +128,10 @@ impl TranspositionTable {
     pub fn clear(&mut self) {
         self.generation = 0;
         self.clusters.fill(Cluster::zero());
+    }
+
+    pub fn generation(&self) -> u8 {
+        self.generation
     }
 
     pub fn next_search(&mut self) {

@@ -7,7 +7,7 @@ use crate::position::Position;
 use crate::heuristic;
 use crate::tt;
 
-pub fn best_move(position: &mut Position, max_depth: Option<usize>,
+pub fn best_move(position: &mut Position, max_depth: Option<u8>,
     soft_deadline_dur: Option<Duration>, hard_deadline_dur: Option<Duration>,
     tt: &mut tt::TranspositionTable) -> Option<Move> {
     let move_scores = evaluate_moves(
@@ -27,7 +27,7 @@ pub fn best_move(position: &mut Position, max_depth: Option<usize>,
 }
 
 // Returns {move -> score for current player}
-pub fn evaluate_moves(position: &mut Position, max_depth: Option<usize>,
+pub fn evaluate_moves(position: &mut Position, max_depth: Option<u8>,
     soft_deadline_dur: Option<Duration>, hard_deadline_dur: Option<Duration>,
     tt: &mut tt::TranspositionTable) -> HashMap<Move, Value> {
     let start_time = Instant::now();
@@ -61,7 +61,7 @@ pub fn evaluate_moves(position: &mut Position, max_depth: Option<usize>,
         reached_depth = depth;
 
         if depth >= MAX_PLY ||
-            max_depth.map(|md| depth as usize >= md).unwrap_or(false) ||
+            max_depth.map(|md| depth >= md).unwrap_or(false) ||
             soft_deadline.map(|deadline| Instant::now() >= deadline).unwrap_or(false) {
                 break;
         }
@@ -74,7 +74,7 @@ pub fn evaluate_moves(position: &mut Position, max_depth: Option<usize>,
 
 fn negamax(position: &mut Position, depth: u8, mut alpha: Value, beta: Value,
     deadline: Option<Instant>, tt: &mut tt::TranspositionTable) -> Option<Value> {
-    if depth == 0 || position.get_outcome().is_some() {
+    if position.get_outcome().is_some() {
         return Some(heuristic::calculate(position));
     } else if deadline.is_some() && depth >= 3 && Instant::now() > deadline.unwrap() {
         // TODO - min depth heuristic should be tuned to avoid too frequent time comparisons
@@ -97,7 +97,13 @@ fn negamax(position: &mut Position, depth: u8, mut alpha: Value, beta: Value,
         best_move = Some(tt_data.best_move);
     }
 
-    let mut moves = position.legal_moves().collect::<Vec<_>>();
+    // If depth == 0, only search series of immediate captures (i.e. quiescence search)
+    let mut moves = position.legal_moves()
+        .filter(|m| depth > 0 || m.is_capture)
+        .collect::<Vec<_>>();
+    if moves.is_empty() {
+        return Some(heuristic::calculate(position));
+    }
     // Sort the moves with the TT best move first, then all other captures, then everything else
     moves.sort_by_key(|&m|
         (best_move.map(|bm| bm != m).unwrap_or(false), !m.is_capture));
@@ -106,7 +112,7 @@ fn negamax(position: &mut Position, depth: u8, mut alpha: Value, beta: Value,
     let mut best_move = moves[0];
     for m in moves {
         let undo = position.make_move(m);
-        let child_result = negamax(position, depth - 1, -beta, -alpha, deadline, tt);
+        let child_result = negamax(position, depth.saturating_sub(1), -beta, -alpha, deadline, tt);
         position.undo_move(undo);
 
         let child_value = -child_result?;
@@ -130,7 +136,7 @@ fn negamax(position: &mut Position, depth: u8, mut alpha: Value, beta: Value,
     let tt_data = tt::TTData {
         depth,
         bound,
-        generation: tt.generation,
+        generation: tt.generation(),
         best_move,
         value,
     };

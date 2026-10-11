@@ -5,7 +5,7 @@ pub struct Value(pub i16);
 
 pub const MAX_PLY: u8 = 255;
 
-mod ValueConsts {
+mod value_consts {
     pub const UNDEFINED: i16 = 32_002;
     pub const INFINITY: i16 = 32_001;
     pub const NEG_INFINITY: i16 = -32_001;
@@ -18,24 +18,24 @@ mod ValueConsts {
 }
 
 impl Value {
-    pub fn undef() -> Value { Value(ValueConsts::UNDEFINED) }
-    pub fn infinity() -> Value { Value(ValueConsts::INFINITY) }
-    pub fn draw() -> Value { Value(ValueConsts::DRAW) }
-    pub fn win() -> Value { Value(ValueConsts::WIN) }
-    pub fn win_in(ply: u8) -> Value { Value(ValueConsts::WIN - (ply as i16)) }
-    pub fn loss() -> Value { Value(ValueConsts::LOSS) }
-    pub fn loss_in(ply: u8) -> Value { Value(ValueConsts::LOSS + (ply as i16)) }
+    pub fn undef() -> Value { Value(value_consts::UNDEFINED) }
+    pub fn infinity() -> Value { Value(value_consts::INFINITY) }
+    pub fn draw() -> Value { Value(value_consts::DRAW) }
+    pub fn win() -> Value { Value(value_consts::WIN) }
+    pub fn win_in(ply: u8) -> Value { Value(value_consts::WIN - (ply as i16)) }
+    pub fn loss() -> Value { Value(value_consts::LOSS) }
+    pub fn loss_in(ply: u8) -> Value { Value(value_consts::LOSS + (ply as i16)) }
 
     pub fn is_valid(self) -> bool {
-        self.0 != ValueConsts::UNDEFINED
+        self.0 != value_consts::UNDEFINED
     }
 
     pub fn add_ply(self) -> Self {
         if self.is_win() {
-            debug_assert!(self.0 != ValueConsts::WIN_IN_MAX_PLY);
+            debug_assert!(self.0 != value_consts::WIN_IN_MAX_PLY);
             Self(self.0 - 1)
         } else if self.is_loss() {
-            debug_assert!(self.0 != ValueConsts::LOSS_IN_MAX_PLY);
+            debug_assert!(self.0 != value_consts::LOSS_IN_MAX_PLY);
             Self(self.0 + 1)
         } else {
             self
@@ -44,12 +44,12 @@ impl Value {
 
     pub fn is_win(self) -> bool {
         debug_assert!(self.is_valid());
-        self.0 >= ValueConsts::WIN_IN_MAX_PLY
+        self.0 >= value_consts::WIN_IN_MAX_PLY
     }
 
     pub fn is_loss(self) -> bool {
         debug_assert!(self.is_valid());
-        self.0 <= ValueConsts::LOSS_IN_MAX_PLY
+        self.0 <= value_consts::LOSS_IN_MAX_PLY
     }
 
     pub fn is_win_or_loss(self) -> bool {
@@ -60,16 +60,16 @@ impl Value {
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self.0 {
-            ValueConsts::UNDEFINED => write!(f, "undefined"),
-            ValueConsts::INFINITY => write!(f, "infinity"),
-            ValueConsts::NEG_INFINITY => write!(f, "-infinity"),
-            ValueConsts::WIN => write!(f, "win"),
-            ValueConsts::WIN_IN_MAX_PLY..ValueConsts::WIN  => {
-                write!(f, "win in {} ply", ValueConsts::WIN - self.0)
+            value_consts::UNDEFINED => write!(f, "undefined"),
+            value_consts::INFINITY => write!(f, "infinity"),
+            value_consts::NEG_INFINITY => write!(f, "-infinity"),
+            value_consts::WIN => write!(f, "win"),
+            value_consts::WIN_IN_MAX_PLY..value_consts::WIN  => {
+                write!(f, "win in {} ply", value_consts::WIN - self.0)
             },
-            ValueConsts::LOSS => write!(f, "loss"),
-            ValueConsts::LOSS_IN_ONE_PLY..=ValueConsts::LOSS_IN_MAX_PLY  => {
-                write!(f, "loss in {} ply", self.0 - ValueConsts::LOSS)
+            value_consts::LOSS => write!(f, "loss"),
+            value_consts::LOSS_IN_ONE_PLY..=value_consts::LOSS_IN_MAX_PLY  => {
+                write!(f, "loss in {} ply", self.0 - value_consts::LOSS)
             },
             v => write!(f, "{}", v)
         }

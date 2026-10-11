@@ -94,7 +94,7 @@ fn check_legal_moves(position: &Position, line: &str) {
 struct SearchOpts {
     soft_deadline: Option<Duration>,
     hard_deadline: Option<Duration>,
-    depth: Option<usize>,
+    depth: Option<u8>,
     nodes: Option<usize>,
     search_moves: HashSet<Move>,
 }
@@ -107,7 +107,7 @@ fn parse_search_opts(player: Player, line: &str) -> SearchOpts {
     let mut blue_incr: Option<Duration> = None;
     let mut move_time: Option<Duration> = None;
     let mut search_moves = HashSet::new();
-    let mut depth: Option<usize> = None;
+    let mut depth: Option<u8> = None;
     let mut nodes: Option<usize> = None;
 
     fn parse_as_millis(token: &str) -> Duration {
