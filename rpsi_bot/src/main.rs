@@ -34,8 +34,7 @@ fn main() {
                 let search_opts = parse_search_opts(position.active_player, &line);
                 // TODO - nodes?
                 tt.next_search();
-                let best_move = search::best_move(&mut position, search_opts.depth,
-                    search_opts.soft_deadline, search_opts.hard_deadline, &mut tt).unwrap();
+                let best_move = search::best_move(&mut position, &search_opts, &mut tt).unwrap();
                 println!("bestmove {}", best_move);
             },
             "rpsi" => {
@@ -91,15 +90,7 @@ fn check_legal_moves(position: &Position, line: &str) {
     }
 }
 
-struct SearchOpts {
-    soft_deadline: Option<Duration>,
-    hard_deadline: Option<Duration>,
-    depth: Option<u8>,
-    nodes: Option<usize>,
-    search_moves: HashSet<Move>,
-}
-
-fn parse_search_opts(player: Player, line: &str) -> SearchOpts {
+fn parse_search_opts(player: Player, line: &str) -> search::Opts {
     let mut infinite = false;
     let mut red_time: Option<Duration> = None;
     let mut blue_time: Option<Duration> = None;
@@ -188,5 +179,11 @@ fn parse_search_opts(player: Player, line: &str) -> SearchOpts {
         hard_deadline = Some(abandonment_time);
     }
 
-    SearchOpts { soft_deadline, hard_deadline, depth, nodes, search_moves }
+    search::Opts {
+        max_depth: depth,
+        max_nodes: nodes,
+        search_moves,
+        soft_deadline,
+        hard_deadline,
+    }
 }

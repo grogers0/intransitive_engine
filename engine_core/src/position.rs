@@ -1,3 +1,6 @@
+use rand::{Rng, RngExt};
+use rand::seq::SliceRandom;
+
 use crate::moves::Move;
 use crate::zobrist::ZobristAccumulator;
 use crate::{Player, Piece, Outcome};
@@ -202,6 +205,37 @@ impl Position {
         }
         *board.get_mut(4, 1) = Cell::Occupied(Player::Blue, Piece::Paper);
         *board.get_mut(7, 4) = Cell::Occupied(Player::Red, Piece::Paper);
+
+        let active_player = Player::Blue;
+        let plies_since_capture = 0;
+        let zobrist = Self::fill_zobrist(&board, active_player);
+        Position { board, active_player, plies_since_capture, zobrist }
+    }
+
+    pub fn randomized_initial<R: Rng + ?Sized>(rng: &mut R) -> Position {
+        let mut board = Board::new();
+        // Same initial pieces in the same initial spots, but which piece is in which slot is
+        // different
+        let mut pieces = [Piece::Rock, Piece::Rock, Piece::Rock, Piece::Paper, Piece::Paper,
+        Piece::Paper, Piece::Paper, Piece::Scissors, Piece::Scissors, Piece::Scissors];
+        pieces.shuffle(rng);
+        // If true then mirrored along the diagonal, otherwise rotated 180 degrees. Either of these
+        // keeps the game perfectly symmetrical (should be fair)
+        let diag_mirror = rng.random_bool(0.5);
+        let xys = [
+            (3, 1), (2, 2), (1, 3), (4, 1), (3, 2), (2, 3), (1, 4), (4, 2), (3, 3), (2, 4)];
+
+        for (i, (x, y)) in xys.iter().cloned().enumerate() {
+            let piece = pieces[i];
+            *board.get_mut(x, y) = Cell::Occupied(Player::Blue, piece);
+
+            let (red_x, red_y) = if diag_mirror {
+                (8 - y, 8 - x)
+            } else {
+                (8 - x, 8 - y)
+            };
+            *board.get_mut(red_x, red_y) = Cell::Occupied(Player::Red, piece);
+        }
 
         let active_player = Player::Blue;
         let plies_since_capture = 0;
