@@ -83,3 +83,11 @@ impl ops::Neg for Value {
         Self(-self.0)
     }
 }
+
+impl ops::AddAssign for Value {
+    fn add_assign(&mut self, other: Self) {
+        debug_assert!(self.is_valid() && other.is_valid());
+        self.0 = self.0 + other.0;
+        debug_assert!(!self.is_win_or_loss());
+    }
+}

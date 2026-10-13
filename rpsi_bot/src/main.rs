@@ -141,13 +141,14 @@ fn parse_search_opts(player: Player, line: &str) -> search::Opts {
         }
     }
 
-    let one_sec = Duration::from_millis(1000);
+    let buffer_time = Duration::from_secs(2);
+    let one_sec = Duration::from_secs(1);
     // Give some time for the network to send to the server
     let pad_deadline = |mut deadline: Duration| -> Duration {
-        if deadline >= one_sec {
-            deadline -= one_sec;
+        if deadline >= buffer_time {
+            deadline -= buffer_time;
         } else {
-            deadline = Duration::from_millis(0);
+            deadline = Duration::from_secs(0);
         }
         deadline
     };

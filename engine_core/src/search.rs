@@ -18,6 +18,8 @@ pub struct Opts {
 struct State<'a> {
     pub position: &'a mut Position,
     pub nodes: usize,
+    pub tt_full_hits: usize,
+    pub tt_partial_hits: usize,
     pub max_depth: Option<u8>,
     pub max_nodes: Option<usize>,
     pub search_moves: HashSet<Move>, // If non-empty only search these moves
@@ -56,6 +58,8 @@ pub fn evaluate_moves(position: &mut Position, opts: &Opts, tt: &mut tt::Transpo
     let mut state = State {
         position,
         nodes: 0,
+        tt_full_hits: 0,
+        tt_partial_hits: 0,
         max_depth: opts.max_depth,
         max_nodes: opts.max_nodes,
         search_moves: opts.search_moves.clone(),
@@ -85,7 +89,7 @@ pub fn evaluate_moves(position: &mut Position, opts: &Opts, tt: &mut tt::Transpo
 
             match child_result {
                 None => break 'outer,
-                Some(v) => depth_move_scores.insert(m, -v),
+                Some(v) => depth_move_scores.insert(m, -v.add_ply()),
             };
         }
         state.hard_deadline = hard_deadline;
@@ -100,8 +104,9 @@ pub fn evaluate_moves(position: &mut Position, opts: &Opts, tt: &mut tt::Transpo
         }
     }
 
-    eprintln!("reached depth {}, searched {} nodes, took {:?}",
-        reached_depth, state.nodes, start_time.elapsed());
+    eprintln!("reached depth {}, searched {} nodes, full TT hits: {}, partial TT hits: {}, took {:?}",
+        reached_depth, state.nodes, state.tt_full_hits, state.tt_partial_hits,
+        start_time.elapsed());
 
     move_scores
 }
@@ -123,13 +128,17 @@ fn negamax(state: &mut State, depth: u8, mut alpha: Value, beta: Value)
     if let Some(tt_data) = state.tt.get(state.position.zobrist.hash_value()) {
         if tt_data.depth >= depth {
             if tt_data.bound == tt::Bound::Exact {
+                state.tt_full_hits += 1;
                 return Some(tt_data.value);
             } else if tt_data.bound == tt::Bound::Lower && tt_data.value >= beta {
+                state.tt_full_hits += 1;
                 return Some(tt_data.value);
             } else if tt_data.bound == tt::Bound::Upper && tt_data.value <= alpha {
+                state.tt_full_hits += 1;
                 return Some(tt_data.value);
             }
         }
+        state.tt_partial_hits += 1;
         best_move = Some(tt_data.best_move);
     }
 
@@ -151,7 +160,7 @@ fn negamax(state: &mut State, depth: u8, mut alpha: Value, beta: Value)
         let child_result = negamax(state, depth.saturating_sub(1), -beta, -alpha);
         state.position.undo_move(undo);
 
-        let child_value = -child_result?;
+        let child_value = -child_result?.add_ply();
         if child_value > value {
             best_move = m;
             value = child_value;
