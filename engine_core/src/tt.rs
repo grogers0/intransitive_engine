@@ -6,7 +6,7 @@ use crate::Value;
 
 // This largely follows the design of the stockfish TT. It's a 3-way associative hash table
 
-pub const DEFAULT_TT_SIZE_MB: usize = 100;
+pub const DEFAULT_TT_SIZE_MB: usize = 1000;
 
 const CLUSTER_SIZE: usize = 4;
 const GENERATION_BITS: usize = 5;

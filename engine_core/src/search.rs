@@ -18,11 +18,11 @@ pub struct Opts {
 struct State<'a> {
     pub position: &'a mut Position,
     pub nodes: usize,
+    pub evals: usize,
     pub tt_full_hits: usize,
     pub tt_partial_hits: usize,
     pub max_depth: Option<u8>,
     pub max_nodes: Option<usize>,
-    pub search_moves: HashSet<Move>, // If non-empty only search these moves
     pub soft_deadline: Option<Instant>,
     pub hard_deadline: Option<Instant>,
     pub tt: &'a mut tt::TranspositionTable,
@@ -30,19 +30,82 @@ struct State<'a> {
 
 pub fn best_move(position: &mut Position, opts: &Opts, tt: &mut tt::TranspositionTable)
     -> Option<Move> {
-    let move_scores = evaluate_moves(position, opts, tt);
-    let mut best_move: Option<Move> = None;
-    let mut best_score = -Value::infinity();
-    for (m, score) in move_scores {
-        if best_move.is_none() || score > best_score {
-            best_move = Some(m);
-            best_score = score;
+    if let Some(_) = position.get_outcome() {
+        return None; // No moves to try
+    }
+
+    let start_time = Instant::now();
+    let hard_deadline = opts.hard_deadline.map(|dur| start_time + dur);
+    let soft_deadline = opts.soft_deadline.map(|dur| start_time + dur).or(hard_deadline);
+    let mut state = State {
+        position,
+        nodes: 0,
+        evals: 0,
+        tt_full_hits: 0,
+        tt_partial_hits: 0,
+        max_depth: opts.max_depth,
+        max_nodes: opts.max_nodes,
+        soft_deadline,
+        hard_deadline,
+        tt,
+    };
+
+    let mut moves = state.position.legal_moves()
+        .filter(|m| opts.search_moves.is_empty() || opts.search_moves.contains(m))
+        .collect::<Vec<_>>();
+    moves.sort_by_key(|&m| !m.is_capture);
+    let mut best_move = moves[0];
+    let mut best_value = -Value::infinity();
+
+    let mut reached_depth = 0;
+    'outer:
+    for depth in 1u8.. {
+        let hard_deadline = state.hard_deadline;
+        if depth == 1 {
+            state.hard_deadline = None;
+        }
+
+        // Sort the moves with the previous best move first, then all other captures, then everything else
+        moves.sort_by_key(|&m| (best_move != m, !m.is_capture));
+        let mut value = -Value::infinity();
+        let mut alpha = -Value::infinity();
+        let mut depth_best_move = best_move;
+
+        for &m in &moves {
+            let undo = state.position.make_move(m);
+            let child_result = negamax(&mut state, depth - 1, -Value::infinity(), -alpha);
+            state.position.undo_move(undo);
+
+            match child_result {
+                None => break 'outer,
+                Some(child_value) => {
+                    let v = -child_value.add_ply();
+                    if v > value {
+                        depth_best_move = m;
+                        value = v;
+                    }
+                },
+            };
+            alpha = max(alpha, value);
+        }
+        state.hard_deadline = hard_deadline;
+
+        best_value = value;
+        best_move = depth_best_move;
+        reached_depth = depth;
+
+        if depth >= MAX_PLY ||
+            state.max_depth.map(|md| depth >= md).unwrap_or(false) ||
+            state.soft_deadline.map(|deadline| Instant::now() >= deadline).unwrap_or(false) {
+                break;
         }
     }
-    if best_move.is_some() {
-        eprintln!("best score: {best_score} best move: {}", best_move.unwrap());
-    }
-    best_move
+
+    eprintln!("best_move: {}, value: {}, reached depth {}, searched {} nodes, made {} evals, full TT hits: {}, partial TT hits: {}, took {:?}",
+        best_move, best_value, reached_depth, state.nodes, state.evals, state.tt_full_hits,
+        state.tt_partial_hits, start_time.elapsed());
+
+    Some(best_move)
 }
 
 // Returns {move -> score for current player}
@@ -58,11 +121,11 @@ pub fn evaluate_moves(position: &mut Position, opts: &Opts, tt: &mut tt::Transpo
     let mut state = State {
         position,
         nodes: 0,
+        evals: 0,
         tt_full_hits: 0,
         tt_partial_hits: 0,
         max_depth: opts.max_depth,
         max_nodes: opts.max_nodes,
-        search_moves: opts.search_moves.clone(),
         soft_deadline,
         hard_deadline,
         tt,
@@ -80,7 +143,7 @@ pub fn evaluate_moves(position: &mut Position, opts: &Opts, tt: &mut tt::Transpo
         }
 
         for m in state.position.legal_moves().collect::<Vec<_>>() {
-            if !state.search_moves.is_empty() && !state.search_moves.contains(&m) {
+            if !opts.search_moves.is_empty() && !opts.search_moves.contains(&m) {
                 continue;
             }
             let undo = state.position.make_move(m);
@@ -104,8 +167,8 @@ pub fn evaluate_moves(position: &mut Position, opts: &Opts, tt: &mut tt::Transpo
         }
     }
 
-    eprintln!("reached depth {}, searched {} nodes, full TT hits: {}, partial TT hits: {}, took {:?}",
-        reached_depth, state.nodes, state.tt_full_hits, state.tt_partial_hits,
+    eprintln!("reached depth {}, searched {} nodes, made {} evals, full TT hits: {}, partial TT hits: {}, took {:?}",
+        reached_depth, state.nodes, state.evals, state.tt_full_hits, state.tt_partial_hits,
         start_time.elapsed());
 
     move_scores
@@ -113,8 +176,8 @@ pub fn evaluate_moves(position: &mut Position, opts: &Opts, tt: &mut tt::Transpo
 
 fn negamax(state: &mut State, depth: u8, mut alpha: Value, beta: Value)
     -> Option<Value> {
-    if state.position.get_outcome().is_some() {
-        return Some(heuristic::calculate(state.position));
+    if let Some(outcome) = state.position.get_outcome() {
+        return Some(heuristic::calculate_outcome(outcome, state.position.active_player));
     } else if depth >= 3 &&
         (state.hard_deadline.map(|dl| Instant::now() > dl).unwrap_or(false) ||
          state.max_nodes.map(|max| state.nodes > max).unwrap_or(false)) {
@@ -147,7 +210,8 @@ fn negamax(state: &mut State, depth: u8, mut alpha: Value, beta: Value)
         .filter(|m| depth > 0 || m.is_capture)
         .collect::<Vec<_>>();
     if moves.is_empty() {
-        return Some(heuristic::calculate(state.position));
+        state.evals += 1;
+        return Some(heuristic::calculate_diff(state.position));
     }
     // Sort the moves with the TT best move first, then all other captures, then everything else
     moves.sort_by_key(|&m|

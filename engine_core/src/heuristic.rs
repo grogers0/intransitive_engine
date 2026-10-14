@@ -3,23 +3,21 @@ use std::collections::HashMap;
 use crate::{Outcome, Value, Player, Piece};
 use crate::position::{Cell, Position};
 
-// As centi-pieces where positive values mean the active player is ahead
-pub fn calculate(position: &Position) -> Value {
-    // FIXME - make this NNUE or something good. For now it just uses the raw piece count
-    match position.get_outcome() {
-        Some(Outcome::Draw) => Value::draw(),
-        Some(Outcome::Win(player)) => {
-            if player == position.active_player { Value::win() } else { Value::loss() }
-        },
-        None => {
-            let mut value = total_piece_diff(position);
-            value += self_guarding_diff(position);
-            value += aggression_diff(position);
-            value += influence_diff(position);
-
-            value
-        },
+pub fn calculate_outcome(outcome: Outcome, active_player: Player) -> Value {
+    match outcome {
+        Outcome::Draw => Value::draw(),
+        Outcome::Win(winner) => if winner == active_player { Value::win() } else { Value::loss() },
     }
+}
+
+// As milli-pieces where positive values mean the active player is ahead
+pub fn calculate_diff(position: &Position) -> Value {
+    // FIXME - make this NNUE or something good. For now it just uses the raw piece count
+    let mut value = total_piece_diff(position);
+    value += self_guarding_diff(position);
+    value += aggression_diff(position);
+    value += influence_diff(position);
+    value
 }
 
 // Simple number of pieces of each side
@@ -33,7 +31,7 @@ fn total_piece_diff(position: &Position) -> Value {
             }
         }
     }
-    Value(diff * 100)
+    Value(diff * 1000)
 }
 
 // Directly guarding your other pieces prevents attacks
