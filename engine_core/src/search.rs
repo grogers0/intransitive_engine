@@ -5,6 +5,7 @@ use crate::{Value, Move, MAX_PLY};
 use crate::position::Position;
 use crate::heuristic;
 use crate::tt;
+use crate::killers::Killers;
 
 pub struct Opts {
     pub max_depth: Option<u8>,
@@ -25,6 +26,7 @@ struct State<'a> {
     pub soft_deadline: Option<Instant>,
     pub hard_deadline: Option<Instant>,
     pub tt: &'a mut tt::TranspositionTable,
+    pub killers: Killers,
 }
 
 pub fn best_move(position: &mut Position, opts: &Opts, tt: &mut tt::TranspositionTable) -> Move {
@@ -46,6 +48,7 @@ pub fn best_move(position: &mut Position, opts: &Opts, tt: &mut tt::Transpositio
         soft_deadline,
         hard_deadline,
         tt,
+        killers: Killers::new(),
     };
 
     let mut moves = state.position.legal_moves()
@@ -58,6 +61,7 @@ pub fn best_move(position: &mut Position, opts: &Opts, tt: &mut tt::Transpositio
     let mut reached_depth = 0;
     'outer:
     for depth in 1u8.. {
+        state.killers.shift_for_depth_increase(depth);
         let hard_deadline = state.hard_deadline;
         if depth == 1 {
             state.hard_deadline = None;
@@ -125,6 +129,7 @@ pub fn evaluate_moves(position: &mut Position, opts: &Opts, tt: &mut tt::Transpo
         soft_deadline,
         hard_deadline,
         tt,
+        killers: Killers::new(),
     };
 
     let mut move_scores = HashMap::new();
@@ -205,8 +210,8 @@ fn negamax(state: &mut State, depth: u8, mut alpha: Value, beta: Value) -> Value
     let mut moves = state.position.legal_moves()
         .filter(|m| depth > 0 || m.is_capture)
         .collect::<Vec<_>>();
-    // Sort the moves with the TT best move first, then all other captures, then everything else
-    moves.sort_by_key(|&m| (best_move != m, !m.is_capture));
+    // Sort the moves with the TT best move first, then all other captures, then killers, then everything else
+    moves.sort_by_key(|&m| (best_move != m, !m.is_capture, state.killers.get(depth, m)));
 
     let mut value = -Value::infinity();
     let mut bound_override: Option<tt::Bound> = None;
@@ -232,6 +237,9 @@ fn negamax(state: &mut State, depth: u8, mut alpha: Value, beta: Value) -> Value
                 alpha = value;
             }
             if alpha >= beta {
+                if !m.is_capture {
+                    state.killers.add(depth, m);
+                }
                 break;
             }
         }
