@@ -1,6 +1,5 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
-use std::cmp::max;
 
 use crate::{Value, Move, MAX_PLY};
 use crate::position::Position;
@@ -28,10 +27,9 @@ struct State<'a> {
     pub tt: &'a mut tt::TranspositionTable,
 }
 
-pub fn best_move(position: &mut Position, opts: &Opts, tt: &mut tt::TranspositionTable)
-    -> Option<Move> {
+pub fn best_move(position: &mut Position, opts: &Opts, tt: &mut tt::TranspositionTable) -> Move {
     if let Some(_) = position.get_outcome() {
-        return None; // No moves to try
+        return Move::invalid(); // No moves to try
     }
 
     let start_time = Instant::now();
@@ -67,7 +65,6 @@ pub fn best_move(position: &mut Position, opts: &Opts, tt: &mut tt::Transpositio
 
         // Sort the moves with the previous best move first, then all other captures, then everything else
         moves.sort_by_key(|&m| (best_move != m, !m.is_capture));
-        let mut value = -Value::infinity();
         let mut alpha = -Value::infinity();
         let mut depth_best_move = best_move;
 
@@ -76,27 +73,26 @@ pub fn best_move(position: &mut Position, opts: &Opts, tt: &mut tt::Transpositio
             let child_result = negamax(&mut state, depth - 1, -Value::infinity(), -alpha);
             state.position.undo_move(undo);
 
-            match child_result {
-                None => break 'outer,
-                Some(child_value) => {
-                    let v = -child_value.add_ply();
-                    if v > value {
-                        depth_best_move = m;
-                        value = v;
-                    }
-                },
-            };
-            alpha = max(alpha, value);
+            if !child_result.is_valid() {
+                break 'outer;
+            } else {
+                let v = -child_result.add_ply();
+                if v > alpha {
+                    depth_best_move = m;
+                    alpha = v;
+                }
+            }
         }
         state.hard_deadline = hard_deadline;
 
-        best_value = value;
+        best_value = alpha;
         best_move = depth_best_move;
         reached_depth = depth;
 
         if depth >= MAX_PLY ||
             state.max_depth.map(|md| depth >= md).unwrap_or(false) ||
-            state.soft_deadline.map(|deadline| Instant::now() >= deadline).unwrap_or(false) {
+            state.soft_deadline.map(|deadline| Instant::now() >= deadline).unwrap_or(false) ||
+            best_value.is_win_or_loss() {
                 break;
         }
     }
@@ -105,7 +101,7 @@ pub fn best_move(position: &mut Position, opts: &Opts, tt: &mut tt::Transpositio
         best_move, best_value, reached_depth, state.nodes, state.evals, state.tt_full_hits,
         state.tt_partial_hits, start_time.elapsed());
 
-    Some(best_move)
+    best_move
 }
 
 // Returns {move -> score for current player}
@@ -150,10 +146,11 @@ pub fn evaluate_moves(position: &mut Position, opts: &Opts, tt: &mut tt::Transpo
             let child_result = negamax(&mut state, depth - 1, -Value::infinity(), Value::infinity());
             state.position.undo_move(undo);
 
-            match child_result {
-                None => break 'outer,
-                Some(v) => depth_move_scores.insert(m, -v.add_ply()),
-            };
+            if !child_result.is_valid() {
+                break 'outer;
+            } else {
+                depth_move_scores.insert(m, -child_result.add_ply());
+            }
         }
         state.hard_deadline = hard_deadline;
 
@@ -174,68 +171,75 @@ pub fn evaluate_moves(position: &mut Position, opts: &Opts, tt: &mut tt::Transpo
     move_scores
 }
 
-fn negamax(state: &mut State, depth: u8, mut alpha: Value, beta: Value)
-    -> Option<Value> {
+fn negamax(state: &mut State, depth: u8, mut alpha: Value, beta: Value) -> Value {
     if let Some(outcome) = state.position.get_outcome() {
-        return Some(heuristic::calculate_outcome(outcome, state.position.active_player));
+        return heuristic::calculate_outcome(outcome, state.position.active_player);
     } else if depth >= 3 &&
         (state.hard_deadline.map(|dl| Instant::now() > dl).unwrap_or(false) ||
          state.max_nodes.map(|max| state.nodes > max).unwrap_or(false)) {
-        return None;
+        return Value::invalid();
     }
     state.nodes += 1;
 
     let alpha_orig = alpha;
-    let mut best_move: Option<Move> = None;
+    let mut best_move = Move::invalid();
 
     if let Some(tt_data) = state.tt.get(state.position.zobrist.hash_value()) {
         if tt_data.depth >= depth {
             if tt_data.bound == tt::Bound::Exact {
                 state.tt_full_hits += 1;
-                return Some(tt_data.value);
+                return tt_data.value;
             } else if tt_data.bound == tt::Bound::Lower && tt_data.value >= beta {
                 state.tt_full_hits += 1;
-                return Some(tt_data.value);
+                return tt_data.value;
             } else if tt_data.bound == tt::Bound::Upper && tt_data.value <= alpha {
                 state.tt_full_hits += 1;
-                return Some(tt_data.value);
+                return tt_data.value;
             }
         }
         state.tt_partial_hits += 1;
-        best_move = Some(tt_data.best_move);
+        best_move = tt_data.best_move;
     }
 
     // If depth == 0, only search series of immediate captures (i.e. quiescence search)
     let mut moves = state.position.legal_moves()
         .filter(|m| depth > 0 || m.is_capture)
         .collect::<Vec<_>>();
-    if moves.is_empty() {
-        state.evals += 1;
-        return Some(heuristic::calculate_diff(state.position));
-    }
     // Sort the moves with the TT best move first, then all other captures, then everything else
-    moves.sort_by_key(|&m|
-        (best_move.map(|bm| bm != m).unwrap_or(false), !m.is_capture));
+    moves.sort_by_key(|&m| (best_move != m, !m.is_capture));
 
     let mut value = -Value::infinity();
-    let mut best_move = moves[0];
-    for m in moves {
-        let undo = state.position.make_move(m);
-        let child_result = negamax(state, depth.saturating_sub(1), -beta, -alpha);
-        state.position.undo_move(undo);
+    let mut bound_override: Option<tt::Bound> = None;
+    if moves.is_empty() {
+        state.evals += 1;
+        value = heuristic::calculate_diff(state.position);
+        bound_override = Some(tt::Bound::Exact);
+    } else {
+        for m in moves {
+            let undo = state.position.make_move(m);
+            let child_result = negamax(state, depth.saturating_sub(1), -beta, -alpha);
+            state.position.undo_move(undo);
 
-        let child_value = -child_result?.add_ply();
-        if child_value > value {
-            best_move = m;
-            value = child_value;
-        }
-        alpha = max(alpha, value);
-        if alpha >= beta {
-            break;
+            if !child_result.is_valid() {
+                return Value::invalid();
+            }
+            let v = -child_result.add_ply();
+            if v > value {
+                best_move = m;
+                value = v;
+            }
+            if value > alpha {
+                alpha = value;
+            }
+            if alpha >= beta {
+                break;
+            }
         }
     }
 
-    let bound = if value <= alpha_orig {
+    let bound = if let Some(b) = bound_override {
+        b
+    } else if value <= alpha_orig {
         tt::Bound::Upper
     } else if value >= beta {
         tt::Bound::Lower
@@ -251,5 +255,5 @@ fn negamax(state: &mut State, depth: u8, mut alpha: Value, beta: Value)
     };
     state.tt.put(state.position.zobrist.hash_value(), &tt_data);
 
-    Some(value)
+    value
 }

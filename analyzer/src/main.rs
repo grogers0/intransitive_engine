@@ -1,20 +1,23 @@
 use std::cmp;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashSet};
 use std::time::Duration;
 
 use engine_core::{tt, search, Move, Value, Position};
 
 fn main() {
-    let soft_deadline: Option<Duration> = None; // Some(Duration::from_secs(3));
-    let hard_deadline: Option<Duration> = None; // Duration::from_secs(60);
-    let max_depth: Option<u8> = Some(6);
-    let top_n = 100;
+    let opts = search::Opts {
+        max_depth: Some(6),
+        max_nodes: None,
+        search_moves: HashSet::new(),
+        soft_deadline: None, // Some(Duration::from_secs(3)),
+        hard_deadline: None, // Some(Duration::from_secs(60)),
+    };
+    let top_n = 40;
     let mut tt = tt::TranspositionTable::new(tt::DEFAULT_TT_SIZE_MB);
     for fen_str in std::env::args().skip(1) {
         let mut position = Position::from_fen(&fen_str);
         tt.next_search();
-        let move_values = search::evaluate_moves(
-            &mut position, max_depth, soft_deadline, hard_deadline, &mut tt);
+        let move_values = search::evaluate_moves(&mut position, &opts, &mut tt);
         let mut heap = BinaryHeap::new();
         #[derive(Eq, PartialEq)]
         struct HeapElem(Move, Value);

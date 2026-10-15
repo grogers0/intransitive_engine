@@ -6,7 +6,7 @@ pub struct Value(pub i16);
 pub const MAX_PLY: u8 = 255;
 
 mod value_consts {
-    pub const UNDEFINED: i16 = 32_002;
+    pub const INVALID: i16 = 32_002;
     pub const INFINITY: i16 = 32_001;
     pub const NEG_INFINITY: i16 = -32_001;
     pub const WIN: i16 = 32_000;
@@ -18,7 +18,7 @@ mod value_consts {
 }
 
 impl Value {
-    pub fn undef() -> Value { Value(value_consts::UNDEFINED) }
+    pub fn invalid() -> Value { Value(value_consts::INVALID) }
     pub fn infinity() -> Value { Value(value_consts::INFINITY) }
     pub fn draw() -> Value { Value(value_consts::DRAW) }
     pub fn win() -> Value { Value(value_consts::WIN) }
@@ -27,7 +27,7 @@ impl Value {
     pub fn loss_in(ply: u8) -> Value { Value(value_consts::LOSS + (ply as i16)) }
 
     pub fn is_valid(self) -> bool {
-        self.0 != value_consts::UNDEFINED
+        self.0 != value_consts::INVALID
     }
 
     pub fn add_ply(self) -> Self {
@@ -60,7 +60,7 @@ impl Value {
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self.0 {
-            value_consts::UNDEFINED => write!(f, "undefined"),
+            value_consts::INVALID => write!(f, "invalid"),
             value_consts::INFINITY => write!(f, "infinity"),
             value_consts::NEG_INFINITY => write!(f, "-infinity"),
             value_consts::WIN => write!(f, "win"),

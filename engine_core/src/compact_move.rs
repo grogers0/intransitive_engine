@@ -22,8 +22,6 @@ pub struct CompactMove(pub u16);
 impl From<Move> for CompactMove {
     fn from(m: Move) -> CompactMove {
         let mut ret = CompactMove(0);
-        debug_assert!(m.from_x < 9);
-        debug_assert!(m.from_y < 9);
         ret.0 |= m.from_x as u16;
         ret.0 |= (m.from_y as u16) << 4;
         debug_assert!(m.to_x + 1 - m.from_x <= 2);
@@ -71,6 +69,11 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_invalid_move_round_trip() {
+        check_round_trip(Move::invalid());
     }
 
     fn check_round_trip(m: Move) {

@@ -32,9 +32,8 @@ fn main() {
             s if s.starts_with("legalmoves ") => check_legal_moves(&position, &line),
             s if s.starts_with("go ") => {
                 let search_opts = parse_search_opts(position.active_player, &line);
-                // TODO - nodes?
                 tt.next_search();
-                let best_move = search::best_move(&mut position, &search_opts, &mut tt).unwrap();
+                let best_move = search::best_move(&mut position, &search_opts, &mut tt);
                 println!("bestmove {}", best_move);
             },
             "rpsi" => {
