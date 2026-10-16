@@ -2,7 +2,7 @@ use std::cmp;
 use std::collections::{BinaryHeap, HashSet};
 use std::time::Duration;
 
-use engine_core::{tt, search, Move, Value, Position};
+use engine_core::{tt, search, history, Move, Value, Position};
 
 fn main() {
     let opts = search::Opts {
@@ -14,10 +14,11 @@ fn main() {
     };
     let top_n = 40;
     let mut tt = tt::TranspositionTable::new(tt::DEFAULT_TT_SIZE_MB);
+    let mut history = history::HistoryTable::new();
     for fen_str in std::env::args().skip(1) {
         let mut position = Position::from_fen(&fen_str);
         tt.next_search();
-        let move_values = search::evaluate_moves(&mut position, &opts, &mut tt);
+        let move_values = search::evaluate_moves(&mut position, &opts, &mut tt, &mut history);
         let mut heap = BinaryHeap::new();
         #[derive(Eq, PartialEq)]
         struct HeapElem(Move, Value);

@@ -3,9 +3,9 @@ use std::time::{Duration, Instant};
 
 use crate::{Value, Move, MAX_PLY};
 use crate::position::Position;
-use crate::heuristic;
-use crate::tt;
+use crate::{heuristic, tt};
 use crate::killers::Killers;
+use crate::history::HistoryTable;
 
 pub struct Opts {
     pub max_depth: Option<u8>,
@@ -27,9 +27,11 @@ struct State<'a> {
     pub hard_deadline: Option<Instant>,
     pub tt: &'a mut tt::TranspositionTable,
     pub killers: Killers,
+    pub history: &'a mut HistoryTable,
 }
 
-pub fn best_move(position: &mut Position, opts: &Opts, tt: &mut tt::TranspositionTable) -> Move {
+pub fn best_move(position: &mut Position, opts: &Opts, tt: &mut tt::TranspositionTable,
+    history: &mut HistoryTable) -> Move {
     if let Some(_) = position.get_outcome() {
         return Move::invalid(); // No moves to try
     }
@@ -49,6 +51,7 @@ pub fn best_move(position: &mut Position, opts: &Opts, tt: &mut tt::Transpositio
         hard_deadline,
         tt,
         killers: Killers::new(),
+        history,
     };
 
     let mut moves = state.position.legal_moves()
@@ -109,8 +112,8 @@ pub fn best_move(position: &mut Position, opts: &Opts, tt: &mut tt::Transpositio
 }
 
 // Returns {move -> score for current player}
-pub fn evaluate_moves(position: &mut Position, opts: &Opts, tt: &mut tt::TranspositionTable)
-    -> HashMap<Move, Value> {
+pub fn evaluate_moves(position: &mut Position, opts: &Opts, tt: &mut tt::TranspositionTable,
+    history: &mut HistoryTable) -> HashMap<Move, Value> {
     if let Some(_) = position.get_outcome() {
         return HashMap::new(); // No moves to try
     }
@@ -130,6 +133,7 @@ pub fn evaluate_moves(position: &mut Position, opts: &Opts, tt: &mut tt::Transpo
         hard_deadline,
         tt,
         killers: Killers::new(),
+        history,
     };
 
     let mut move_scores = HashMap::new();
@@ -186,6 +190,7 @@ fn negamax(state: &mut State, depth: u8, mut alpha: Value, beta: Value) -> Value
     }
     state.nodes += 1;
 
+    let active_player = state.position.active_player;
     let alpha_orig = alpha;
     let mut best_move = Move::invalid();
 
@@ -210,8 +215,12 @@ fn negamax(state: &mut State, depth: u8, mut alpha: Value, beta: Value) -> Value
     let mut moves = state.position.legal_moves()
         .filter(|m| depth > 0 || m.is_capture)
         .collect::<Vec<_>>();
-    // Sort the moves with the TT best move first, then all other captures, then killers, then everything else
-    moves.sort_by_key(|&m| (best_move != m, !m.is_capture, state.killers.get(depth, m)));
+    // Order moves by 1) hash move, 2) captures, 3) killers, 4) history
+    moves.sort_by_key(|&m| (
+            best_move != m,
+            !m.is_capture,
+            state.killers.get(depth, m),
+            state.history.get(active_player, m)));
 
     let mut value = -Value::infinity();
     let mut bound_override: Option<tt::Bound> = None;
@@ -220,7 +229,7 @@ fn negamax(state: &mut State, depth: u8, mut alpha: Value, beta: Value) -> Value
         value = heuristic::calculate_diff(state.position);
         bound_override = Some(tt::Bound::Exact);
     } else {
-        for m in moves {
+        for &m in moves.iter() {
             let undo = state.position.make_move(m);
             let child_result = negamax(state, depth.saturating_sub(1), -beta, -alpha);
             state.position.undo_move(undo);
@@ -239,6 +248,13 @@ fn negamax(state: &mut State, depth: u8, mut alpha: Value, beta: Value) -> Value
             if alpha >= beta {
                 if !m.is_capture {
                     state.killers.add(depth, m);
+                    state.history.give_bonus(active_player, m, depth);
+                    for &m2 in moves.iter() {
+                        if m == m2 { break; }
+                        if !m.is_capture {
+                            state.history.give_penalty(active_player, m, depth);
+                        }
+                    }
                 }
                 break;
             }

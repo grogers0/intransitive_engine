@@ -8,6 +8,7 @@ pub mod tt;
 pub mod value;
 pub mod zobrist;
 pub mod killers;
+pub mod history;
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug, Hash)]
 pub enum Player {

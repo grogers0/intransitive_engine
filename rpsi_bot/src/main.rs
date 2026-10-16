@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::io::{self, Write};
 use std::time::Duration;
 
-use engine_core::{Move, Position, Player, search, tt};
+use engine_core::{Move, Position, Player, search, tt, history};
 
 const HASH_OPTION_PREFIX: &str = "setoption name Hash value ";
 
@@ -10,6 +10,7 @@ fn main() {
     let tt_max_size_mb: usize = 128_000; // TODO - set this limit based on system memory?
     let mut position = Position::initial();
     let mut tt = tt::TranspositionTable::new(tt::DEFAULT_TT_SIZE_MB);
+    let mut history = history::HistoryTable::new();
     for line in io::stdin().lines().map(|line| line.unwrap()) {
         match line.as_str() {
             s if s.starts_with("setoption ") => {
@@ -33,7 +34,8 @@ fn main() {
             s if s.starts_with("go ") => {
                 let search_opts = parse_search_opts(position.active_player, &line);
                 tt.next_search();
-                let best_move = search::best_move(&mut position, &search_opts, &mut tt);
+                let best_move = search::best_move(
+                    &mut position, &search_opts, &mut tt, &mut history);
                 println!("bestmove {}", best_move);
             },
             "rpsi" => {
@@ -56,6 +58,7 @@ fn main() {
             "newgame V6" => {
                 position = Position::initial();
                 tt.clear();
+                history.clear();
             },
             "stop" => {
                 // TODO - interrupt searching and emit the best move
