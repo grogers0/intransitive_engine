@@ -37,7 +37,7 @@ if active_player == 0, then blue is to move, otherwise if 1 then red is to move
 
 */
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Ord, PartialOrd, Debug)]
 pub struct CompactPosition([u8; 32]);
 
 impl From<&Position> for CompactPosition {

@@ -1,14 +1,13 @@
 pub mod compact_move;
 pub mod compact_position;
 pub mod heuristic;
+pub mod history;
+pub mod killers;
 pub mod moves;
 pub mod position;
-pub mod search;
 pub mod tt;
 pub mod value;
 pub mod zobrist;
-pub mod killers;
-pub mod history;
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug, Hash)]
 pub enum Player {

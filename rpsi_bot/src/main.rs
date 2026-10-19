@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::io::{self, Write};
 use std::time::Duration;
 
-use engine_core::{Move, Position, Player, search, tt, history};
+use base::{Move, Position, Player, tt, history};
 
 const HASH_OPTION_PREFIX: &str = "setoption name Hash value ";
 

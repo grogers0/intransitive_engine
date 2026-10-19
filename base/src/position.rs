@@ -206,10 +206,7 @@ impl Position {
         *board.get_mut(4, 1) = Cell::Occupied(Player::Blue, Piece::Paper);
         *board.get_mut(7, 4) = Cell::Occupied(Player::Red, Piece::Paper);
 
-        let active_player = Player::Blue;
-        let plies_since_capture = 0;
-        let zobrist = Self::fill_zobrist(&board, active_player);
-        Position { board, active_player, plies_since_capture, zobrist }
+        Self::from_board_and_player(board, Player::Blue)
     }
 
     pub fn randomized_initial<R: Rng + ?Sized>(rng: &mut R) -> Position {
@@ -237,10 +234,7 @@ impl Position {
             *board.get_mut(red_x, red_y) = Cell::Occupied(Player::Red, piece);
         }
 
-        let active_player = Player::Blue;
-        let plies_since_capture = 0;
-        let zobrist = Self::fill_zobrist(&board, active_player);
-        Position { board, active_player, plies_since_capture, zobrist }
+        Self::from_board_and_player(board, Player::Blue)
     }
 
     pub fn parse_rpsi_position(s: &str) -> Position {
@@ -254,9 +248,8 @@ impl Position {
             ch => panic!("Invalid active player '{}'", ch),
         };
         tokens.next().unwrap(); // Skip territory for intransitive
-        let zobrist = Self::fill_zobrist(&board, active_player);
 
-        let mut position = Position { board, active_player, plies_since_capture: 0, zobrist };
+        let mut position = Self::from_board_and_player(board, active_player);
 
         match tokens.next() {
             Some("moves") => {
@@ -280,9 +273,13 @@ impl Position {
             ch => panic!("Invalid active player '{}'", ch),
         };
         assert!(tokens.next().is_none());
-        let zobrist = Self::fill_zobrist(&board, active_player);
+        Self::from_board_and_player(board, active_player)
+    }
 
-        Position { board, active_player, plies_since_capture: 0, zobrist }
+    pub fn from_board_and_player(board: Board, active_player: Player) -> Position {
+        let plies_since_capture = 0;
+        let zobrist = Self::fill_zobrist(&board, active_player);
+        Position { board, active_player, plies_since_capture, zobrist }
     }
 
 

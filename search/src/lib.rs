@@ -1,11 +1,11 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use crate::{Value, Move, MAX_PLY};
-use crate::position::Position;
-use crate::{heuristic, tt};
-use crate::killers::Killers;
-use crate::history::HistoryTable;
+use base::{Value, Move, MAX_PLY};
+use base::position::Position;
+use base::{heuristic, tt};
+use base::killers::Killers;
+use base::history::HistoryTable;
 
 pub struct Opts {
     pub max_depth: Option<u8>,

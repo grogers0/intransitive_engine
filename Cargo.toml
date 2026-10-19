@@ -1,0 +1,15 @@
+[workspace]
+members = [
+    "analyzer",
+    "base",
+    "rpsi_bot",
+    "search",
+]
+resolver = "3"
+default-members = ["rpsi_bot"]
+
+[workspace.dependencies]
+base = { path = "base" }
+search = { path = "search" }
+rand = "0.10"
+num_cpus = "1"
