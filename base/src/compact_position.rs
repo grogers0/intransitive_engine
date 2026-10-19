@@ -86,8 +86,10 @@ impl From<&CompactPosition> for Position {
     fn from(cp: &CompactPosition) -> Position {
         let mut board = Board::new();
         let mut zobrist = ZobristAccumulator::new();
+        let mut total_pieces = 0;
         let mut set_cell = |x: u8, y: u8, player: Player, piece: Piece| {
             *board.get_mut(x, y) = Cell::Occupied(player, piece);
+            total_pieces += 1;
             zobrist.xor_piece(x, y, player, piece);
         };
 
@@ -130,7 +132,7 @@ impl From<&CompactPosition> for Position {
         }
         byte_idx += 1;
         let plies_since_capture = cp.0[byte_idx];
-        Position { board, active_player, plies_since_capture, zobrist }
+        Position { board, active_player, plies_since_capture, total_pieces, zobrist }
     }
 }
 

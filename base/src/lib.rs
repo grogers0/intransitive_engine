@@ -44,6 +44,6 @@ pub enum Outcome {
 }
 
 pub use value::{Value, MAX_PLY};
-pub use position::Position;
+pub use position::{Position, Cell, Board};
 pub use moves::Move;
 pub use tt::TranspositionTable;

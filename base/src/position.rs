@@ -18,6 +18,7 @@ pub struct Position {
     pub board: Board,
     pub active_player: Player,
     pub plies_since_capture: u8,
+    pub total_pieces: u8,
     pub zobrist: ZobristAccumulator,
 }
 
@@ -58,7 +59,8 @@ impl Board {
                 'R' => {
                     assert!(x < 9);
                     *board.get_mut(x, y) = Cell::Occupied(Player::Blue, Piece::Rock);
-                    x += 1; },
+                    x += 1;
+                },
                 'P' => {
                     assert!(x < 9);
                     *board.get_mut(x, y) = Cell::Occupied(Player::Blue, Piece::Paper);
@@ -278,8 +280,9 @@ impl Position {
 
     pub fn from_board_and_player(board: Board, active_player: Player) -> Position {
         let plies_since_capture = 0;
-        let zobrist = Self::fill_zobrist(&board, active_player);
-        Position { board, active_player, plies_since_capture, zobrist }
+        let zobrist = Self::calc_zobrist(&board, active_player);
+        let total_pieces = Self::calc_total_pieces(&board);
+        Position { board, active_player, plies_since_capture, total_pieces, zobrist }
     }
 
 
@@ -341,6 +344,7 @@ impl Position {
         self.zobrist.xor_player();
 
         if let Cell::Occupied(player, piece) = self.board.get(m.to_x, m.to_y) {
+            self.total_pieces -= 1;
             self.zobrist.xor_piece(m.to_x, m.to_y, player, piece);
         }
         if let Cell::Occupied(player, piece) = self.board.get(m.from_x, m.from_y) {
@@ -366,9 +370,11 @@ impl Position {
 
         for &UndoCell { x, y, cell } in &undo.cells {
             if let Cell::Occupied(player, piece) = self.board.get(x, y) {
+                self.total_pieces -= 1;
                 self.zobrist.xor_piece(x, y, player, piece);
             }
             if let Cell::Occupied(player, piece) = cell {
+                self.total_pieces += 1;
                 self.zobrist.xor_piece(x, y, player, piece);
             }
 
@@ -376,7 +382,7 @@ impl Position {
         }
     }
 
-    fn fill_zobrist(board: &Board, active_player: Player) -> ZobristAccumulator {
+    fn calc_zobrist(board: &Board, active_player: Player) -> ZobristAccumulator {
         let mut zobrist = ZobristAccumulator::new();
         for y in 0..9 {
             for x in 0..9 {
@@ -389,6 +395,18 @@ impl Position {
             zobrist.xor_player();
         }
         zobrist
+    }
+
+    fn calc_total_pieces(board: &Board) -> u8 {
+        let mut cnt = 0;
+        for y in 0..9 {
+            for x in 0..9 {
+                if let Cell::Occupied(_, _) = board.get(x, y) {
+                    cnt += 1;
+                }
+            }
+        }
+        cnt
     }
 }
 
