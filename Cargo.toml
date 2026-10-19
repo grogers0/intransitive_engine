@@ -4,6 +4,7 @@ members = [
     "base",
     "rpsi_bot",
     "search",
+    "tablebase",
 ]
 resolver = "3"
 

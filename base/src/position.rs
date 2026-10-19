@@ -308,6 +308,14 @@ impl Position {
         dx >= -1 && dx <= 1 && dy >= -1 && dy <= 1
     }
 
+    // returns (x, y)
+    pub fn corner_goal(player: Player) -> (u8, u8) {
+        match player {
+            Player::Blue => (8, 8),
+            Player::Red => (0, 0),
+        }
+    }
+
     pub fn get_outcome(&self) -> Option<Outcome> {
         if let Cell::Occupied(Player::Red, _) = self.board.get(0, 0) {
             Some(Outcome::Win(Player::Red))
