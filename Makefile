@@ -1,21 +1,26 @@
-.PHONY: all clean test build build-debug run run-debug
+.PHONY: all clean test build build-dev build-debug run run-debug
 
-all: build-debug test
+all: build-dev test
 
 clean:
 	cargo clean
 
-build-debug:
+build-dev:
 	cargo build --workspace
 
 build:
 	cargo build --workspace --release
 
+build-debug:
+	cargo build --workspace --profile release-debug
+
 test:
 	cargo test --workspace
 
-run-debug:
-	cargo run
+run: build
+	./rpsbot.py -- target/release/rpsi_bot
 
-run:
-	cargo run --release
+run-debug: build-debug
+	./rpsbot.py -- target/release-debug/rpsi_bot
+
+
