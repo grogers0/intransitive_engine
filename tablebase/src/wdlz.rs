@@ -3,17 +3,15 @@ use std::{fmt, ops};
 // Representation of either a Win, Draw, or Loss, and how many moves until the next capture if
 // a win or loss
 
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Debug)]
 pub struct WDLZ(i8);
 
 mod wdlz_consts {
     pub const INVALID: i8 = i8::MIN;
     pub const DRAW: i8 = 0;
     pub const WIN: i8 = i8::MAX;
-    pub const WIN_IN_ONE_PLY: i8 = WIN - 1;
     pub const WIN_IN_MAX_PLY: i8 = 1;
     pub const LOSS: i8 = -WIN;
-    pub const LOSS_IN_ONE_PLY: i8 = -WIN + 1;
     pub const LOSS_IN_MAX_PLY: i8 = -1;
 }
 
@@ -43,6 +41,7 @@ impl WDLZ {
     }
 
     pub fn add_ply(&self) -> Self {
+        debug_assert!(self.is_valid());
         const WIN_IN_ONE_LESS_THEN_MAX_PLY: i8 = wdlz_consts::WIN_IN_MAX_PLY + 1;
         match self.0 {
             wdlz_consts::INVALID => panic!("invalid"),

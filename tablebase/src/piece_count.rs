@@ -55,6 +55,10 @@ impl PieceCount {
             self.red_rock + self.red_paper + self.red_scissors
     }
 
+    pub fn total_for_player(&self, player: Player) -> u8 {
+        Piece::iter().map(|piece| self.get(player, piece)).sum()
+    }
+
     pub fn from_board(board: &Board) -> Self {
         let mut ret = PieceCount::ZERO;
         for y in 0..9 {

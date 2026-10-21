@@ -4,9 +4,8 @@ use crate::{combinatorics, PieceCount};
 
 use base::{Cell, Board, Player, Piece};
 
-pub fn board_to_index(board: &Board) -> (u64, PieceCount) {
-    let orig_piece_count = PieceCount::from_board(board);
-    let mut piece_count = orig_piece_count;
+pub fn board_to_index(board: &Board, mut piece_count: PieceCount) -> u64 {
+    debug_assert_eq!(piece_count, PieceCount::from_board(board));
     let mut index = 0;
 
     for piece in Piece::iter() {
@@ -53,7 +52,7 @@ pub fn board_to_index(board: &Board) -> (u64, PieceCount) {
         }
     }
 
-    (index, orig_piece_count)
+    index
 }
 
 pub fn index_to_board(mut index: u64, mut piece_count: PieceCount) -> Board {
@@ -188,7 +187,8 @@ mod tests {
             add_random_piece(&mut board, Player::Red, &mut rng);
         }
 
-        let (index, piece_count) = board_to_index(&board);
+        let piece_count = PieceCount::from_board(&board);
+        let index = board_to_index(&board, piece_count);
         assert!(index < index_count(piece_count), "{index} should be less than {}", index_count(piece_count));
         let board2 = index_to_board(index, piece_count);
         assert_eq!(board, board2);
@@ -214,7 +214,7 @@ mod tests {
                         }
                     }
                 }
-                let index = board_to_index(&board).0;
+                let index = board_to_index(&board, pc);
                 assert_eq!(index, index_count(pc) - 1);
                 let board2 = index_to_board(index, pc);
                 assert_eq!(board, board2);

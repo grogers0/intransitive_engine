@@ -10,6 +10,7 @@ resolver = "3"
 
 [profile.release-debug]
 inherits = "release"
+debug = true
 debug-assertions = true
 overflow-checks = true
 

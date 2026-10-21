@@ -137,6 +137,42 @@ impl Board {
     }
 }
 
+pub struct AdjacentLocs {
+    x: u8,
+    y: u8,
+    i: u8,
+}
+
+impl AdjacentLocs {
+    pub fn new(x: u8, y: u8) -> AdjacentLocs {
+        AdjacentLocs { x, y, i: 0, }
+    }
+}
+
+impl Iterator for AdjacentLocs {
+    type Item = (u8, u8);
+    fn next(&mut self) -> Option<Self::Item> {
+        while self.i < 8 {
+            let adj_xy = match self.i {
+                0 if self.x > 0 && self.y > 0 => Some((self.x - 1, self.y - 1)),
+                1 if               self.y > 0 => Some((self.x    , self.y - 1)),
+                2 if self.x < 8 && self.y > 0 => Some((self.x + 1, self.y - 1)),
+                3 if self.x > 0               => Some((self.x - 1, self.y    )),
+                4 if self.x < 8               => Some((self.x + 1, self.y    )),
+                5 if self.x > 0 && self.y < 8 => Some((self.x - 1, self.y + 1)),
+                6 if               self.y < 8 => Some((self.x    , self.y + 1)),
+                7 if self.x < 8 && self.y < 8 => Some((self.x + 1, self.y + 1)),
+                _ => None
+            };
+            self.i += 1;
+            if adj_xy.is_some() {
+                return adj_xy;
+            }
+        }
+        None
+    }
+}
+
 pub struct LegalMoves<'a> {
     position: &'a Position,
     x: u8,

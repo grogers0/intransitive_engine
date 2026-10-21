@@ -36,9 +36,17 @@ pub enum Piece {
 impl Piece {
     pub fn can_capture(self, other: Piece) -> bool {
         match self {
-            Piece::Rock => other == Piece::Scissors,
-            Piece::Paper => other == Piece::Rock,
+            Piece::Rock     => other == Piece::Scissors,
+            Piece::Paper    => other == Piece::Rock,
             Piece::Scissors => other == Piece::Paper,
+        }
+    }
+
+    pub fn captured_by(self) -> Piece {
+        match self {
+            Piece::Rock     => Piece::Paper,
+            Piece::Paper    => Piece::Scissors,
+            Piece::Scissors => Piece::Rock,
         }
     }
 
@@ -54,6 +62,6 @@ pub enum Outcome {
 }
 
 pub use value::{Value, MAX_PLY};
-pub use position::{Position, Cell, Board};
+pub use position::{Position, Cell, Board, AdjacentLocs};
 pub use moves::Move;
 pub use tt::TranspositionTable;
