@@ -21,6 +21,11 @@ impl Player {
             Player::Red => Player::Blue,
         }
     }
+
+    const ALL: [Player; 2] = [Player::Blue, Player::Red];
+    pub fn iter() -> impl Iterator<Item = Player> {
+        Self::ALL.iter().cloned()
+    }
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug, Hash)]
@@ -35,6 +40,11 @@ impl Piece {
             Piece::Paper => other == Piece::Rock,
             Piece::Scissors => other == Piece::Paper,
         }
+    }
+
+    const ALL: [Piece; 3] = [Piece::Rock, Piece::Paper, Piece::Scissors];
+    pub fn iter() -> impl Iterator<Item = Piece> {
+        Self::ALL.iter().cloned()
     }
 }
 

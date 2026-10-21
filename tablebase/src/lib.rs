@@ -1,8 +1,8 @@
-mod combinatorics;
-mod normalization;
-mod piece_count;
-mod position_index;
-mod wdlz;
+pub mod combinatorics;
+pub mod normalization;
+pub mod piece_count;
+pub mod position_index;
+pub mod wdlz;
 
 pub use piece_count::PieceCount;
 pub use wdlz::WDLZ;

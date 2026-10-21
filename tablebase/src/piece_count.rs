@@ -1,6 +1,6 @@
 use std::{cmp, ops};
 
-use base::{Player, Piece};
+use base::{Board, Cell, Player, Piece};
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct PieceCount {
@@ -22,7 +22,7 @@ impl PieceCount {
         red_scissors: 0,
     };
 
-    pub fn from(player: Player, piece: Piece) -> Self {
+    pub fn single(player: Player, piece: Piece) -> Self {
         let mut pc = Self::ZERO;
         *pc.get_mut(player, piece) += 1;
         pc
@@ -53,6 +53,51 @@ impl PieceCount {
     pub fn total(&self) -> u8 {
         self.blue_rock + self.blue_paper + self.blue_scissors +
             self.red_rock + self.red_paper + self.red_scissors
+    }
+
+    pub fn from_board(board: &Board) -> Self {
+        let mut ret = PieceCount::ZERO;
+        for y in 0..9 {
+            for x in 0..9 {
+                if let Cell::Occupied(player, piece) = board.get(x, y) {
+                    *ret.get_mut(player, piece) += 1;
+                }
+            }
+        }
+        ret
+    }
+
+    pub fn players_flipped(&self) -> Self {
+        Self {
+            blue_rock: self.red_rock,
+            blue_paper: self.red_paper,
+            blue_scissors: self.red_scissors,
+            red_rock: self.blue_rock,
+            red_paper: self.blue_paper,
+            red_scissors: self.blue_scissors,
+        }
+    }
+
+    pub fn enumerate_useful_piece_counts(total: u8) -> Vec<Self> {
+        let mut ret = Vec::new();
+        for blue_total in 1..total {
+            let red_total = total - blue_total;
+            for blue_rock in 0..=blue_total {
+                for blue_paper in 0..=(blue_total - blue_rock) {
+                    let blue_scissors = blue_total - blue_rock - blue_paper;
+                    for red_rock in 0..=red_total {
+                        for red_paper in 0..=(red_total - red_rock) {
+                            let red_scissors = red_total - red_rock - red_paper;
+                            ret.push(PieceCount {
+                                blue_rock, blue_paper, blue_scissors,
+                                red_rock, red_paper, red_scissors,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        ret
     }
 }
 

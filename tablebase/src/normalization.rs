@@ -27,7 +27,11 @@ pub struct NormalizeResult {
 
 pub fn is_normalized(position: &Position) -> bool {
     if position.active_player == Player::Red { return false; }
-    let pc = calc_piece_counts(position);
+    if !is_count_normalized(PieceCount::from_board(&position.board)) { return false; }
+    true
+}
+
+pub fn is_count_normalized(pc: PieceCount) -> bool {
     if pc.blue_rock < pc.blue_paper || pc.blue_rock < pc.blue_scissors { return false; }
     if pc.blue_rock > pc.blue_paper && pc.blue_rock <= pc.blue_scissors { return false; }
     if pc.blue_rock == pc.blue_paper && pc.blue_rock == pc.blue_scissors {
@@ -49,7 +53,7 @@ pub fn normalize(position: &mut Position) -> NormalizeResult {
         res.invert_player = true;
         invert_player(position);
     }
-    let mut piece_count = calc_piece_counts(position);
+    let mut piece_count = PieceCount::from_board(&position.board);
     let piece_shift = calc_piece_shift(piece_count);
     res.piece_shift = piece_shift.invert();
     shift_pieces(position, piece_shift);
@@ -59,6 +63,11 @@ pub fn normalize(position: &mut Position) -> NormalizeResult {
 
     debug_assert!(is_normalized(position));
     res
+}
+
+pub fn normalize_count(piece_count: PieceCount) -> PieceCount {
+    let piece_shift = calc_piece_shift(piece_count);
+    shift_piece_count(piece_count, piece_shift)
 }
 
 pub fn undo_normalize(position: &mut Position, res: NormalizeResult) {
@@ -90,19 +99,6 @@ impl PieceShift {
             (PieceShift::Backward, Piece::Scissors) => Piece::Paper,
         }
     }
-}
-
-// Returns [total, upper_left, lower_right]
-fn calc_piece_counts(position: &Position) -> PieceCount {
-    let mut ret = PieceCount::ZERO;
-    for y in 0..9 {
-        for x in 0..9 {
-            if let Cell::Occupied(player, piece) = position.board.get(x, y) {
-                *ret.get_mut(player, piece) += 1;
-            }
-        }
-    }
-    ret
 }
 
 fn calc_piece_shift(pc: PieceCount) -> PieceShift {
@@ -234,5 +230,45 @@ mod tests {
         let res = normalize(&mut pos);
         undo_normalize(&mut pos, res);
         assert_eq!(pos, pos2);
+    }
+
+    #[test]
+    fn test_piece_count_normalizing_example() {
+        let pc = PieceCount {
+            blue_rock: 2,
+            blue_paper: 1,
+            blue_scissors: 2,
+            red_rock: 1,
+            red_paper: 2,
+            red_scissors: 3,
+        };
+        assert!(!is_count_normalized(pc));
+        let pcn = normalize_count(pc);
+        assert!(is_count_normalized(pcn));
+        assert_eq!(pcn, PieceCount {
+            blue_rock: 2,
+            blue_paper: 2,
+            blue_scissors: 1,
+            red_rock: 3,
+            red_paper: 1,
+            red_scissors: 2,
+
+        });
+    }
+
+    #[test]
+    fn test_piece_count_normalizing_exhaustive() {
+        for total_pieces in 0..7 {
+            for pc in PieceCount::enumerate_useful_piece_counts(total_pieces) {
+
+                let pc_n = normalize_count(pc);
+                assert!(is_count_normalized(pc_n));
+
+                let pc_fn = normalize_count(pc.players_flipped());
+                assert!(is_count_normalized(pc_fn));
+
+                assert_eq!(pc_n, normalize_count(pc_fn.players_flipped()));
+            }
+        }
     }
 }
