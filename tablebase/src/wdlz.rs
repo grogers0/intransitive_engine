@@ -19,7 +19,7 @@ impl WDLZ {
     pub fn invalid() -> Self { Self(wdlz_consts::INVALID) }
     pub fn is_valid(&self) -> bool { self.0 != wdlz_consts::INVALID }
 
-    pub fn draw(&self) -> Self { Self(wdlz_consts::DRAW) }
+    pub fn draw() -> Self { Self(wdlz_consts::DRAW) }
 
     pub fn win() -> Self { Self(wdlz_consts::WIN) }
     pub fn win_in(ply: u8) -> Self {

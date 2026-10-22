@@ -3,8 +3,7 @@ use std::fs;
 use std::io;
 
 use tablebase::{PieceCount, WDLZ, position_index, normalization};
-use base::{AdjacentLocs, Move, Outcome, Player, Piece, Position};
-use base::position::{Board, Cell};
+use base::{AdjacentLocs, Move, Cell, Outcome, Player, Position};
 
 struct Opts {
     upto_pieces: u8,
@@ -41,19 +40,17 @@ fn main() {
         for piece_count in PieceCount::enumerate_useful_piece_counts(total_count) {
             let piece_count = normalization::normalize_count(piece_count);
             if tablebases.contains_key(&piece_count) { continue; }
-            let (tb1, tb2) = gen_ply1_tablebase(piece_count, &tablebases);
-            // TODO
+            let (tb1, tb2) = gen_tablebase(piece_count, &tablebases);
             tablebases.insert(piece_count, tb1);
             let inverse_piece_count = normalization::normalize_count(piece_count.players_flipped());
             tablebases.insert(inverse_piece_count, tb2);
         }
     }
 
-    println!("{} bytes", tablebases.iter().map(|(pc, tb)| tb.len()).sum::<usize>());
-
     check_all_tablebases(&tablebases);
 
-    for (piece_count, tablebase) in tablebases {
+    /*
+    for (&piece_count, tablebase) in &tablebases {
         println!("----------\n{}", tablebase_name(piece_count));
         for index in 0..tablebase.len() {
             let board = position_index::index_to_board(index as u64, piece_count);
@@ -62,14 +59,14 @@ fn main() {
             }
         }
     }
+    */
 
+    println!("{} bytes", tablebases.iter().map(|(_, tablebase)| tablebase.len()).sum::<usize>());
 }
 
 fn check_all_tablebases(tablebases: &HashMap<PieceCount, MemTb>) {
-    return; // FIXME
     if cfg!(debug_assertions) {
         for (&piece_count, tablebase) in tablebases {
-            if piece_count.total() == 1 { continue; }
             assert!(normalization::is_count_normalized(piece_count));
             for index in 0..tablebase.len() {
                 let stored = tablebase[index];
@@ -78,148 +75,181 @@ fn check_all_tablebases(tablebases: &HashMap<PieceCount, MemTb>) {
                 let mut position = Position::from_board_and_player(board, Player::Blue);
                 assert!(position.get_outcome().is_none());
                 let mut best = WDLZ::loss();
+                let mut best_move = Move::invalid();
                 for m in position.legal_moves().collect::<Vec<_>>() {
                     let undo = position.make_move(m);
                     match position.get_outcome() {
-                        Some(Outcome::Win(Player::Blue)) => best = WDLZ::win_in(1),
-                        Some(_) => unreachable!(),
+                        Some(Outcome::Win(Player::Blue)) => {
+                            best = WDLZ::win_in(1);
+                            best_move = m;
+                        },
+                        Some(Outcome::Win(Player::Red)) => unreachable!(),
+                        Some(Outcome::Draw) => unreachable!(),
                         None => {
-                            let res = normalization::normalize(&mut position);
+                            let res = normalization::normalize_position(&mut position);
                             let index2 = position_index::board_to_index(&position.board,res.piece_count) as usize;
                             let v = -tablebases[&res.piece_count][index2].add_ply();
-                            if v > best { best = v; }
-                            normalization::undo_normalize(&mut position, res);
+                            if v > best {
+                                best = v;
+                                best_move = m;
+                            }
+                            normalization::undo_normalize_position(&mut position, res);
                         }
                     }
 
                     position.undo_move(undo);
                 }
-                assert_eq!(best, stored);
+                assert_eq!(best, stored, "board: {}, best_move: {best_move}, best: {best} != stored in tablebase: {stored}", position.board.to_fen());
             }
         }
     }
 }
 
-fn iter_all_boards<F: FnMut(&Board) -> ()>(mut piece_count: PieceCount, board: &mut Board, mut f: F) {
-    fn recurse<F: FnMut(&Board) -> ()>(piece_count: &mut PieceCount, prev_xy: Option<(u8, u8)>,
-        board: &mut Board, f: &mut F) {
-        if *piece_count == PieceCount::ZERO {
-            f(board);
-            return;
-        }
-        let min_y = prev_xy.map(|(_, y)| y).unwrap_or(0);
-        let min_x = |y: u8| -> u8 {
-            if let Some((px, py)) = prev_xy && py == y {
-                px + 1
-            } else {
-                0
-            }
-        };
-        for y in min_y..9 {
-            for x in min_x(y)..9 {
-                if let Cell::Occupied(_, _) = board.get(x, y) { continue; }
-                for player in Player::iter() {
-                    if (x, y) == Position::corner_goal(player) { continue; }
-                    for piece in Piece::iter() {
-                        if piece_count.get(player, piece) == 0 { continue; }
-                        *board.get_mut(x, y) = Cell::Occupied(player, piece);
-                        *piece_count.get_mut(player, piece) -= 1;
-                        let next_xy = if *piece_count.get_mut(player, piece) > 0 { Some((x, y)) } else { None };
-                        let mut board2 = board.clone();
-                        recurse(piece_count, prev_xy, &mut board2, f);
-                        *piece_count.get_mut(player, piece) += 1;
-                        *board.get_mut(x, y) = Cell::Empty;
-                    }
-                }
-            }
-        }
-    }
-    recurse(&mut piece_count, None, board, &mut f);
-}
-
-
-fn gen_ply1_tablebase(base_piece_count: PieceCount, tablebases: &HashMap<PieceCount, MemTb>) -> (MemTb, MemTb) {
+fn gen_tablebase(base_piece_count: PieceCount, tablebases: &HashMap<PieceCount, MemTb>) -> (MemTb, MemTb) {
     debug_assert!(normalization::is_count_normalized(base_piece_count));
     let mut base_tablebase = vec![WDLZ::invalid(); position_index::index_count(base_piece_count) as usize];
     let inverse_piece_count = normalization::normalize_count(base_piece_count.players_flipped());
     let mut inverse_tablebase = vec![WDLZ::invalid(); position_index::index_count(inverse_piece_count) as usize];
     debug_assert_eq!(base_tablebase.len(), inverse_tablebase.len());
 
-    let mut board = Board::new();
+    let mut prev_queue = Vec::new();
+    let mut next_queue = Vec::new();
 
-    for (tablebase, piece_count, is_inverse) in [(&mut base_tablebase, base_piece_count, false), (&mut inverse_tablebase, inverse_piece_count, true)] {
-        // Any position we can move (with or without capture) to the goal in 1 move is a win in 1 ply
-        for piece in Piece::iter() {
-            if piece_count.get(Player::Blue, piece) == 0 { continue; }
-            for (x, y) in [(8, 7), (7, 8)] {
-                *board.get_mut(x, y) = Cell::Occupied(Player::Blue, piece);
-                let remaining_piece_count = piece_count - PieceCount::single(Player::Blue, piece);
-                iter_all_boards(remaining_piece_count, &mut board, |b| {
-                    let is_win = match b.get(8, 8) {
-                        Cell::Empty => true,
-                        Cell::Occupied(Player::Red, piece2) => piece.can_capture(piece2),
-                        Cell::Occupied(Player::Blue, _) => unreachable!(),
-                    };
-                    if is_win {
-                        let index = position_index::board_to_index(b, piece_count);
-                        tablebase[index as usize] = WDLZ::win_in(1);
+    for is_inverse in [false, true] {
+        let (tablebase, piece_count, opposite_tablebase) = if is_inverse {
+            (&mut inverse_tablebase, inverse_piece_count, &mut base_tablebase)
+        } else {
+            (&mut base_tablebase, base_piece_count, &mut inverse_tablebase)
+        };
+        // TODO - rather than enumerating all positions, we can probably smartly enumerate only
+        // those with wins in 1 ply
+        for before_move_index in 0..tablebase.len() {
+            let mut position = Position::from_board_and_player(
+                position_index::index_to_board(before_move_index as u64, piece_count), Player::Blue);
+            let mut best = WDLZ::loss();
+            for m in position.legal_moves().collect::<Vec<_>>() {
+                let undo_move = position.make_move(m);
+                let score = match position.get_outcome() {
+                    Some(Outcome::Win(Player::Blue)) => WDLZ::win_in(1),
+                    Some(Outcome::Win(Player::Red)) => unreachable!(),
+                    Some(Outcome::Draw) => unreachable!(),
+                    None => {
+                        let undo_normalize = normalization::normalize_position(&mut position);
+                        let after_move_index = position_index::board_to_index(
+                            &position.board, undo_normalize.piece_count) as usize;
+                        let mut score = if m.is_capture {
+                            tablebases[&undo_normalize.piece_count][after_move_index]
+                        } else {
+                            opposite_tablebase[after_move_index]
+                        };
+                        if score.is_valid() {
+                            score = -score.add_ply();
+                        }
+                        normalization::undo_normalize_position(&mut position, undo_normalize);
+                        score
+                    },
+                };
+                if score.is_valid() {
+                    if score.is_win() || (best.is_valid() && score > best) {
+                        best = score;
                     }
-                });
-                *board.get_mut(x, y) = Cell::Empty;
+                } else if best.is_valid() && !best.is_win() {
+                    best = WDLZ::invalid();
+                }
+
+                position.undo_move(undo_move);
+            }
+            if best.is_valid() {
+                tablebase[before_move_index] = best;
+                next_queue.push((before_move_index, is_inverse));
             }
         }
+    }
 
-        // Any position that we can capture a piece and end up with red in a losing position (when
-        // normalized) means we are in a winning position
-        for captured_piece in Piece::iter() {
-            let capturing_piece = captured_piece.captured_by();
-            if piece_count.get(Player::Red, captured_piece) == 0 { continue; }
-            if piece_count.get(Player::Blue, capturing_piece) == 0 { continue; }
+    while !next_queue.is_empty() {
+        prev_queue.clear();
+        std::mem::swap(&mut next_queue, &mut prev_queue);
+        for &(target_after_move_index, is_inverse) in &prev_queue {
+            let (tablebase, piece_count, opposite_tablebase, opposite_piece_count) = if !is_inverse {
+                (&mut base_tablebase, base_piece_count, &mut inverse_tablebase, inverse_piece_count)
+            } else {
+                (&mut inverse_tablebase, inverse_piece_count, &mut base_tablebase, base_piece_count)
+            };
+            let mut board = position_index::index_to_board(target_after_move_index as u64, piece_count);
+            for from_y in 0..9 {
+                for from_x in 0..9 {
+                    if let Cell::Occupied(Player::Red, from_piece) = board.get(from_x, from_y) {
+                        for (to_x, to_y) in AdjacentLocs::new(from_x, from_y) {
+                            if board.get(to_x, to_y) != Cell::Empty { continue; }
+                            if (to_x, to_y) == Position::corner_goal(Player::Red) { continue; }
+                            *board.get_mut(from_x, from_y) = Cell::Empty;
+                            *board.get_mut(to_x, to_y) = Cell::Occupied(Player::Red, from_piece);
+                            board.invert_perspective();
+                            let undo_normalize = normalization::normalize_board(
+                                &mut board, piece_count.players_flipped());
 
-            let remaining_piece_count = piece_count - PieceCount::single(Player::Red, captured_piece)
-                - PieceCount::single(Player::Blue, capturing_piece);
+                            let before_move_index =
+                                position_index::board_to_index(&board, opposite_piece_count) as usize;
+                            if !opposite_tablebase[before_move_index].is_valid() {
+                                let mut position = Position::from_board_and_player(board.clone(), Player::Blue);
+                                let mut best = WDLZ::loss();
+                                for m in position.legal_moves().collect::<Vec<_>>() {
+                                    let undo_move = position.make_move(m);
+                                    let score = match position.get_outcome() {
+                                        Some(Outcome::Win(Player::Blue)) => WDLZ::win_in(1),
+                                        Some(Outcome::Win(Player::Red)) => unreachable!(),
+                                        Some(Outcome::Draw) => unreachable!(),
+                                        None => {
+                                            let undo_normalize = normalization::normalize_position(&mut position);
+                                            let after_move_index = position_index::board_to_index(
+                                                &position.board, undo_normalize.piece_count) as usize;
+                                            let mut score = if m.is_capture {
+                                                tablebases[&undo_normalize.piece_count][after_move_index]
+                                            } else {
+                                                tablebase[after_move_index]
+                                            };
+                                            if score.is_valid() {
+                                                score = -score.add_ply();
+                                            }
+                                            normalization::undo_normalize_position(&mut position, undo_normalize);
+                                            score
+                                        },
+                                    };
+                                    if score.is_valid() {
+                                        if score.is_win() || (best.is_valid() && score > best) {
+                                            best = score;
+                                        }
+                                    } else if best.is_valid() && !best.is_win() {
+                                        best = WDLZ::invalid();
+                                    }
 
-            for capturing_y in 0..9 {
-                for capturing_x in 0..9 {
-                    if (capturing_x, capturing_y) == Position::corner_goal(Player::Blue) { continue; }
-                    *board.get_mut(capturing_x, capturing_y) = Cell::Occupied(Player::Blue, capturing_piece);
-                    for (captured_x, captured_y) in AdjacentLocs::new(capturing_x, capturing_y) {
-                        // Already checked captures into goal above
-                        if (captured_x, captured_y) == Position::corner_goal(Player::Blue) { continue; }
-                        *board.get_mut(captured_x, captured_y) = Cell::Occupied(Player::Red, captured_piece);
-                        iter_all_boards(remaining_piece_count, &mut board, |b| {
-                            let before_capture_index = position_index::board_to_index(b, piece_count) as usize;
-                            if remaining_piece_count.total_for_player(Player::Red) == 0 {
-                                println!("trivial win: {}", b.to_fen());
-                                // Trivial win by capturing all their pieces
-                                tablebase[before_capture_index] = WDLZ::win_in(1);
-                            } else {
-                                let mut position_after_capture =
-                                    Position::from_board_and_player(b.clone(), Player::Blue);
-                                position_after_capture.make_move(Move {
-                                    from_x: capturing_x, from_y: capturing_y,
-                                    to_x: captured_x, to_y: captured_y, is_capture: true,
-                                });
-                                debug_assert!(position_after_capture.get_outcome().is_none());
-                                let res = normalization::normalize(&mut position_after_capture);
-                                let after_capture_piece_count = res.piece_count;
-                                let after_capture_index = position_index::board_to_index(
-                                    &position_after_capture.board, after_capture_piece_count) as usize;
-
-                                if tablebases[&after_capture_piece_count][after_capture_index].is_loss() {
-                                    // NOTE - not a win in this many moves, only DTZ of 1
-                                    tablebase[before_capture_index] = WDLZ::win_in(1);
+                                    position.undo_move(undo_move);
+                                }
+                                if best.is_valid() {
+                                    opposite_tablebase[before_move_index] = best;
+                                    next_queue.push((before_move_index, !is_inverse));
                                 }
                             }
-                        });
-                        *board.get_mut(captured_x, captured_y) = Cell::Empty;
+
+                            normalization::undo_normalize_board(&mut board, undo_normalize);
+                            board.invert_perspective();
+                            *board.get_mut(to_x, to_y) = Cell::Empty;
+                            *board.get_mut(from_x, from_y) = Cell::Occupied(Player::Red, from_piece);
+                        }
                     }
-                    *board.get_mut(capturing_x, capturing_y) = Cell::Empty;
                 }
             }
         }
     }
 
+    // If we can't force a win or loss in any remaining position, it's a draw
+    for tablebase in [&mut base_tablebase, &mut inverse_tablebase] {
+        for index in 0..tablebase.len() {
+            if !tablebase[index].is_valid() {
+                tablebase[index] = WDLZ::draw();
+            }
+        }
+    }
 
     (base_tablebase, inverse_tablebase)
 }

@@ -1,6 +1,6 @@
 use crate::PieceCount;
 
-use base::{Player, Piece, Position, Cell};
+use base::{Player, Piece, Position, Board, Cell};
 
 // To avoid repetetive positions taking extra space in the tablebase, we normalize according to the
 // following rules:
@@ -14,7 +14,7 @@ use base::{Player, Piece, Position, Cell};
 
 // NOTE - forward means rock -> paper, backward means paper -> rock
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
-enum PieceShift {
+pub enum PieceShift {
     Forward, Backward, Noop,
 }
 
@@ -42,7 +42,7 @@ pub fn is_count_normalized(pc: PieceCount) -> bool {
 }
 
 // WARNING - does not update zobrist hashes, do not use it in the transposition table until undo!
-pub fn normalize(position: &mut Position) -> NormalizeResult {
+pub fn normalize_position(position: &mut Position) -> NormalizeResult {
     let mut res = NormalizeResult {
         piece_count: PieceCount::ZERO,
         invert_player: false,
@@ -53,16 +53,23 @@ pub fn normalize(position: &mut Position) -> NormalizeResult {
         res.invert_player = true;
         invert_player(position);
     }
-    let mut piece_count = PieceCount::from_board(&position.board);
+    let piece_count = PieceCount::from_board(&position.board);
     let piece_shift = calc_piece_shift(piece_count);
     res.piece_shift = piece_shift.invert();
-    shift_pieces(position, piece_shift);
-    piece_count = shift_piece_count(piece_count, piece_shift);
-
-    res.piece_count = piece_count;
+    shift_pieces(&mut position.board, piece_shift);
+    res.piece_count = shift_piece_count(piece_count, piece_shift);
 
     debug_assert!(is_normalized(position));
+    debug_assert_eq!(res.piece_count, PieceCount::from_board(&position.board));
     res
+}
+
+pub fn normalize_board(board: &mut Board, piece_count: PieceCount) -> PieceShift {
+    debug_assert_eq!(piece_count, PieceCount::from_board(board));
+    let piece_shift = calc_piece_shift(piece_count);
+    let ret = piece_shift.invert();
+    shift_pieces(board, piece_shift);
+    ret
 }
 
 pub fn normalize_count(piece_count: PieceCount) -> PieceCount {
@@ -70,11 +77,15 @@ pub fn normalize_count(piece_count: PieceCount) -> PieceCount {
     shift_piece_count(piece_count, piece_shift)
 }
 
-pub fn undo_normalize(position: &mut Position, res: NormalizeResult) {
+pub fn undo_normalize_position(position: &mut Position, res: NormalizeResult) {
     if res.invert_player {
         invert_player(position);
     }
-    shift_pieces(position, res.piece_shift);
+    shift_pieces(&mut position.board, res.piece_shift);
+}
+
+pub fn undo_normalize_board(board: &mut Board, piece_shift: PieceShift) {
+    shift_pieces(board, piece_shift);
 }
 
 impl PieceShift {
@@ -133,38 +144,15 @@ fn calc_piece_shift(pc: PieceCount) -> PieceShift {
     }
 }
 
-fn swap_cells(position: &mut Position, x1: u8, y1: u8, x2: u8, y2: u8) {
-    let tmp = position.board.get(x1, y1);
-    *position.board.get_mut(x1, y1) = position.board.get(x2, y2);
-    *position.board.get_mut(x2, y2) = tmp;
-}
-
-fn swap_player(position: &mut Position, x: u8, y: u8) {
-    if let Cell::Occupied(player, _piece) = position.board.get_mut(x, y) {
-        *player = player.invert();
-    }
-}
-
 fn invert_player(position: &mut Position) {
     position.active_player = position.active_player.invert();
-    for y in 0..9 {
-        for x in 0..(8 - y) {
-            let x2 = 8 - y;
-            let y2 = 8 - x;
-            swap_player(position, x, y);
-            swap_player(position, x2, y2);
-            swap_cells(position, x, y, x2, y2);
-        }
-    }
-    for i in 0..9 {
-        swap_player(position, i, 8 - i);
-    }
+    position.board.invert_perspective();
 }
 
-fn shift_pieces(position: &mut Position, piece_shift: PieceShift) {
+fn shift_pieces(board: &mut Board, piece_shift: PieceShift) {
     for y in 0..9 {
         for x in 0..9 {
-            if let Cell::Occupied(_player, piece) = position.board.get_mut(x, y) {
+            if let Cell::Occupied(_player, piece) = board.get_mut(x, y) {
                 *piece = piece_shift.shift(*piece);
             }
         }
@@ -191,7 +179,7 @@ mod tests {
     fn test_initial() {
         let mut pos = Position::initial();
         assert!(!is_normalized(&pos)); // More paper than rock
-        let res = normalize(&mut pos);
+        let res = normalize_position(&mut pos);
         assert_eq!(res, NormalizeResult {
             piece_count: PieceCount {
                 blue_rock: 4, blue_paper: 3, blue_scissors: 3,
@@ -203,7 +191,7 @@ mod tests {
             // reflect: false,
         });
         assert_ne!(pos, Position::initial());
-        undo_normalize(&mut pos, res);
+        undo_normalize_position(&mut pos, res);
         assert_eq!(pos, Position::initial());
     }
 
@@ -227,8 +215,8 @@ mod tests {
         }
 
         let pos2 = pos.clone();
-        let res = normalize(&mut pos);
-        undo_normalize(&mut pos, res);
+        let res = normalize_position(&mut pos);
+        undo_normalize_position(&mut pos, res);
         assert_eq!(pos, pos2);
     }
 

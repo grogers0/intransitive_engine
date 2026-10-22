@@ -49,6 +49,33 @@ impl Board {
         &mut self.0[x as usize + 9 * y as usize]
     }
 
+    // Switches all pieces that were red to be blue and vice versa, and reorients them by mirroring
+    // across the "\" diagonal
+    pub fn invert_perspective(&mut self) {
+        fn invert_player(board: &mut Board, x: u8, y: u8) {
+            if let Cell::Occupied(player, _piece) = board.get_mut(x, y) {
+                *player = player.invert();
+            }
+        }
+        fn swap_cells(board: &mut Board, x1: u8, y1: u8, x2: u8, y2: u8) {
+            let tmp = board.get(x1, y1);
+            *board.get_mut(x1, y1) = board.get(x2, y2);
+            *board.get_mut(x2, y2) = tmp;
+        }
+        for y1 in 0..9 {
+            for x1 in 0..(8 - y1) {
+                let x2 = 8 - y1;
+                let y2 = 8 - x1;
+                invert_player(self, x1, y1);
+                invert_player(self, x2, y2);
+                swap_cells(self, x1, y1, x2, y2);
+            }
+        }
+        for i in 0..9 {
+            invert_player(self, i, 8 - i);
+        }
+    }
+
     pub fn from_fen(s: &str) -> Board {
         let mut board = Board::new();
         let mut y = 0;
