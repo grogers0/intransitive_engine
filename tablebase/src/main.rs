@@ -195,6 +195,9 @@ fn precompute_moves_single(piece_count: PieceCount, opposite_piece_count: PieceC
         }
     }
 
+    // To allow binary search during DTM calculation
+    win_in_one.sort();
+
     PrecomputedMoves { win_in_one, captures, moves, backward_moves: Vec::new() }
 }
 fn compute_backward_moves(precomputed_moves: &mut PrecomputedMoves, opposite_precomputed_moves: &PrecomputedMoves) {
@@ -374,7 +377,7 @@ fn compute_dtz(forward_tb: &mut MemTb, inverse_tb: &mut MemTb,
 fn compute_dtm(forward_tb: &mut MemTb, inverse_tb: &mut MemTb,
     smaller_tablebases: &HashMap<PieceCount, MemTb>, forward_precomputed_moves: &PrecomputedMoves,
     inverse_precomputed_moves: &PrecomputedMoves) {
-    let mut queue: VecDeque<(usize, bool)> = VecDeque::new();
+    let mut queue = VecDeque::new();
 
     for is_inverse in [false, true] {
         let (tb, precomputed_moves) = if is_inverse {
@@ -383,6 +386,18 @@ fn compute_dtm(forward_tb: &mut MemTb, inverse_tb: &mut MemTb,
             (&mut *forward_tb, forward_precomputed_moves)
         };
 
+        for before_move_index in 0..tb.wdl.len() {
+            for &(after_capture_piece_count, after_capture_index) in &precomputed_moves.captures[before_move_index] {
+                if smaller_tablebases[&after_capture_piece_count].wdl[after_capture_index] == WDL::Loss {
+                    tb.dtm[before_move_index] = smaller_tablebases[&after_capture_piece_count].dtm[after_capture_index] + 1;
+                    for &after_backward_move_index in &precomputed_moves.backward_moves[before_move_index] {
+                        queue.push_back((after_backward_move_index, !is_inverse));
+                    }
+                }
+            }
+        }
+
+        // NOTE - process wins in 1 ply after captures to overwrite if needed
         for &before_move_index in &precomputed_moves.win_in_one {
             tb.dtm[before_move_index] = 1;
             for &after_backward_move_index in &precomputed_moves.backward_moves[before_move_index] {
@@ -400,13 +415,19 @@ fn compute_dtm(forward_tb: &mut MemTb, inverse_tb: &mut MemTb,
 
         if tb.wdl[before_move_index] == WDL::Draw {
             continue;
-        } else if tb.dtm[before_move_index] != 0 {
-            continue; // already set
         }
         let is_win = tb.wdl[before_move_index] == WDL::Win;
 
         const MAX_DTM: u16 = u16::MAX;
-        let mut best = if is_win { MAX_DTM } else { 0 };
+        let mut best = if is_win {
+            if let Ok(_) = precomputed_moves.win_in_one.binary_search(&before_move_index) {
+                1
+            } else {
+                MAX_DTM
+            }
+        } else {
+            0
+        };
         for &after_move_index in &precomputed_moves.moves[before_move_index] {
             if tb.wdl[before_move_index] != -opposite_tb.wdl[after_move_index] { continue; }
 
@@ -435,7 +456,10 @@ fn compute_dtm(forward_tb: &mut MemTb, inverse_tb: &mut MemTb,
             }
         }
 
-        if best != MAX_DTM && best != 0 {
+        // NOTE - best can be improved after set the first time since the wavefront might explore
+        // a capture first which leads to a high DTM but then discover a faster path directly to
+        // the goal. TODO - we could probably iteratively increase the limit ply to avoid this
+        if best != MAX_DTM && best != tb.dtm[before_move_index] {
             tb.dtm[before_move_index] = best;
             for &after_backward_move_index in &precomputed_moves.backward_moves[before_move_index] {
                 queue.push_back((after_backward_move_index, !is_inverse));
