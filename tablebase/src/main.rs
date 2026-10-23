@@ -1,9 +1,9 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io;
 
-use tablebase::{PieceCount, WDLZ, position_index, normalization};
-use base::{AdjacentLocs, Move, Cell, Outcome, Player, Position};
+use tablebase::{PieceCount, WDL, position_index, normalization};
+use base::{Outcome, Player, Position};
 
 struct Opts {
     upto_pieces: u8,
@@ -24,7 +24,23 @@ fn tablebase_name(pc: PieceCount) -> String {
     s
 }
 
-type MemTb = Vec<WDLZ>;
+// NOTE - all vectors will have the same length
+#[derive(Clone)]
+struct MemTb {
+    wdl: Vec<WDL>,
+    dtz: Vec<u8>,
+    dtm: Vec<u16>,
+}
+
+impl MemTb {
+    fn new(len: usize) -> MemTb {
+        MemTb {
+            wdl: vec![WDL::Draw; len],
+            dtz: vec![0; len],
+            dtm: vec![0; len],
+        }
+    }
+}
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 enum Format {
@@ -61,221 +77,229 @@ fn main() {
     }
     */
 
-    println!("{} bytes", tablebases.iter().map(|(_, tablebase)| tablebase.len()).sum::<usize>());
+    println!("{} bytes", tablebases.iter().map(|(_, tablebase)| tablebase.wdl.len()).sum::<usize>());
 }
 
 fn check_all_tablebases(tablebases: &HashMap<PieceCount, MemTb>) {
     if cfg!(debug_assertions) {
         for (&piece_count, tablebase) in tablebases {
             assert!(normalization::is_count_normalized(piece_count));
-            for index in 0..tablebase.len() {
-                let stored = tablebase[index];
-                assert!(stored.is_valid());
-                let board = position_index::index_to_board(index as u64, piece_count);
-                let mut position = Position::from_board_and_player(board, Player::Blue);
+            for before_move_index in 0..tablebase.wdl.len() {
+                let mut position = Position::from_board_and_player(
+                    position_index::index_to_board(before_move_index as u64, piece_count), Player::Blue);
                 assert!(position.get_outcome().is_none());
-                let mut best = WDLZ::loss();
-                let mut best_move = Move::invalid();
+
+                let mut best = WDL::Loss;
+                // TODO - check dtm & dtz
                 for m in position.legal_moves().collect::<Vec<_>>() {
                     let undo = position.make_move(m);
                     match position.get_outcome() {
-                        Some(Outcome::Win(Player::Blue)) => {
-                            best = WDLZ::win_in(1);
-                            best_move = m;
-                        },
+                        Some(Outcome::Win(Player::Blue)) => best = WDL::Win,
                         Some(Outcome::Win(Player::Red)) => unreachable!(),
                         Some(Outcome::Draw) => unreachable!(),
                         None => {
                             let res = normalization::normalize_position(&mut position);
-                            let index2 = position_index::board_to_index(&position.board,res.piece_count) as usize;
-                            let v = -tablebases[&res.piece_count][index2].add_ply();
-                            if v > best {
-                                best = v;
-                                best_move = m;
-                            }
+                            let after_move_index = position_index::board_to_index(
+                                &position.board, res.piece_count) as usize;
+                            best = std::cmp::max(best, -tablebases[&res.piece_count].wdl[after_move_index]);
                             normalization::undo_normalize_position(&mut position, res);
                         }
                     }
 
                     position.undo_move(undo);
                 }
-                assert_eq!(best, stored, "board: {}, best_move: {best_move}, best: {best} != stored in tablebase: {stored}", position.board.to_fen());
+
+                assert_eq!(best, tablebase.wdl[before_move_index]);
             }
         }
     }
 }
 
-fn gen_tablebase(base_piece_count: PieceCount, tablebases: &HashMap<PieceCount, MemTb>) -> (MemTb, MemTb) {
-    debug_assert!(normalization::is_count_normalized(base_piece_count));
-    let mut base_tablebase = vec![WDLZ::invalid(); position_index::index_count(base_piece_count) as usize];
-    let inverse_piece_count = normalization::normalize_count(base_piece_count.players_flipped());
-    let mut inverse_tablebase = vec![WDLZ::invalid(); position_index::index_count(inverse_piece_count) as usize];
-    debug_assert_eq!(base_tablebase.len(), inverse_tablebase.len());
+// Checking all legal moves is pretty slow so precompute it once for each position
+struct PrecomputedMoves {
+    // Position indexes which can reach the corner in one move (or capture for immediate win)
+    win_in_one: Vec<usize>,
+    captures: Vec<Vec<(PieceCount, usize)>>,
+    // NOTE - non-capturing moves. The index is into the opposite tablebase
+    moves: Vec<Vec<usize>>,
+    // From the given position, which positions (in the opposite tablebase) can reach this position by moving
+    backward_moves: Vec<Vec<usize>>,
+}
+fn precompute_moves_single(piece_count: PieceCount, opposite_piece_count: PieceCount) -> PrecomputedMoves {
+    let len = position_index::index_count(piece_count) as usize;
+    let mut win_in_one = Vec::new();
+    let mut captures = vec![Vec::new(); len];
+    let mut moves = vec![Vec::new(); len];
 
-    let mut prev_queue = Vec::new();
-    let mut next_queue = Vec::new();
+    for before_move_index in 0..len {
+        let mut can_win_in_one = false;
+        let mut position = Position::from_board_and_player(
+            position_index::index_to_board(before_move_index as u64, piece_count), Player::Blue);
+        for m in position.legal_moves().collect::<Vec<_>>() {
+            let undo_move = position.make_move(m);
+            match position.get_outcome() {
+                Some(Outcome::Win(Player::Blue)) => can_win_in_one = true,
+                Some(Outcome::Win(Player::Red)) => unreachable!(),
+                Some(Outcome::Draw) => unreachable!(),
+                None => {
+                    let undo_normalize = normalization::normalize_position(&mut position);
+                    let after_move_index = position_index::board_to_index(
+                        &position.board, undo_normalize.piece_count) as usize;
+                    if m.is_capture {
+                        captures[before_move_index].push((undo_normalize.piece_count, after_move_index));
+                    } else {
+                        debug_assert_eq!(opposite_piece_count, undo_normalize.piece_count);
+                        moves[before_move_index].push(after_move_index);
+                    }
+
+                    normalization::undo_normalize_position(&mut position, undo_normalize);
+                },
+            };
+
+            position.undo_move(undo_move);
+        }
+
+        if can_win_in_one {
+            win_in_one.push(before_move_index);
+        }
+    }
+
+    PrecomputedMoves { win_in_one, captures, moves, backward_moves: Vec::new() }
+}
+fn compute_backward_moves(precomputed_moves: &mut PrecomputedMoves, opposite_precomputed_moves: &PrecomputedMoves) {
+    precomputed_moves.backward_moves = vec![Vec::new(); precomputed_moves.moves.len()];
+    for before_move_index in 0..opposite_precomputed_moves.moves.len() {
+        for &after_move_index in &opposite_precomputed_moves.moves[before_move_index] {
+            precomputed_moves.backward_moves[after_move_index].push(before_move_index);
+        }
+    }
+
+    // TODO - is it necessary? Seems like it may speed up subsequent iterations
+    for after_move_index in 0..precomputed_moves.backward_moves.len() {
+        precomputed_moves.backward_moves[after_move_index].sort();
+    }
+}
+fn precompute_moves(forward_piece_count: PieceCount, inverse_piece_count: PieceCount) -> [PrecomputedMoves; 2] {
+    let mut forward_precomputed_moves = precompute_moves_single(forward_piece_count, inverse_piece_count);
+    let mut inverse_precomputed_moves = precompute_moves_single(inverse_piece_count, forward_piece_count);
+    compute_backward_moves(&mut forward_precomputed_moves, &inverse_precomputed_moves);
+    compute_backward_moves(&mut inverse_precomputed_moves, &forward_precomputed_moves);
+    [forward_precomputed_moves, inverse_precomputed_moves]
+}
+
+
+fn compute_wdl(forward_tb: &mut MemTb, inverse_tb: &mut MemTb,
+    smaller_tablebases: &HashMap<PieceCount, MemTb>, forward_precomputed_moves: &PrecomputedMoves,
+    inverse_precomputed_moves: &PrecomputedMoves) {
+    // If the value in tb.wdl[index] is true or not
+    let mut forward_isset = vec![false; forward_tb.wdl.len()];
+    let mut inverse_isset = vec![false; forward_tb.wdl.len()];
+
+    let mut queue: VecDeque<(usize, bool)> = VecDeque::new();
 
     for is_inverse in [false, true] {
-        let (tablebase, piece_count, opposite_tablebase) = if is_inverse {
-            (&mut inverse_tablebase, inverse_piece_count, &mut base_tablebase)
+        let (tb, isset, precomputed_moves) = if is_inverse {
+            (&mut *inverse_tb, &mut inverse_isset, inverse_precomputed_moves)
         } else {
-            (&mut base_tablebase, base_piece_count, &mut inverse_tablebase)
+            (&mut *forward_tb, &mut forward_isset, forward_precomputed_moves)
         };
-        // TODO - rather than enumerating all positions, we can probably smartly enumerate only
-        // those with wins in 1 ply
-        for before_move_index in 0..tablebase.len() {
-            let mut position = Position::from_board_and_player(
-                position_index::index_to_board(before_move_index as u64, piece_count), Player::Blue);
-            let mut best = WDLZ::loss();
-            for m in position.legal_moves().collect::<Vec<_>>() {
-                let undo_move = position.make_move(m);
-                let score = match position.get_outcome() {
-                    Some(Outcome::Win(Player::Blue)) => WDLZ::win_in(1),
-                    Some(Outcome::Win(Player::Red)) => unreachable!(),
-                    Some(Outcome::Draw) => unreachable!(),
-                    None => {
-                        let undo_normalize = normalization::normalize_position(&mut position);
-                        let after_move_index = position_index::board_to_index(
-                            &position.board, undo_normalize.piece_count) as usize;
-                        let mut score = if m.is_capture {
-                            tablebases[&undo_normalize.piece_count][after_move_index]
-                        } else {
-                            opposite_tablebase[after_move_index]
-                        };
-                        if score.is_valid() {
-                            score = -score.add_ply();
-                        }
-                        normalization::undo_normalize_position(&mut position, undo_normalize);
-                        score
-                    },
-                };
-                if score.is_valid() {
-                    if score.is_win() || (best.is_valid() && score > best) {
-                        best = score;
-                    }
-                } else if best.is_valid() && !best.is_win() {
-                    best = WDLZ::invalid();
-                }
 
-                position.undo_move(undo_move);
+        // Direct win in one
+        for &before_move_index in &precomputed_moves.win_in_one {
+            isset[before_move_index] = true;
+            tb.wdl[before_move_index] = WDL::Win;
+            for &after_backward_move_index in &precomputed_moves.backward_moves[before_move_index] {
+                queue.push_back((after_backward_move_index, !is_inverse));
             }
-            if best.is_valid() {
-                tablebase[before_move_index] = best;
-                next_queue.push((before_move_index, is_inverse));
+        }
+
+        // Capture into a smaller tablebase that wins
+        for before_move_index in 0..tb.wdl.len() {
+            for &(after_capture_piece_count, after_capture_index) in &precomputed_moves.captures[before_move_index] {
+                if smaller_tablebases[&after_capture_piece_count].wdl[after_capture_index] == WDL::Loss {
+                    isset[before_move_index] = true;
+                    tb.wdl[before_move_index] = WDL::Win;
+                    for &after_backward_move_index in &precomputed_moves.backward_moves[before_move_index] {
+                        queue.push_back((after_backward_move_index, !is_inverse));
+                    }
+                }
             }
         }
     }
 
-    while !next_queue.is_empty() {
-        prev_queue.clear();
-        std::mem::swap(&mut next_queue, &mut prev_queue);
-        for &(target_after_move_index, is_inverse) in &prev_queue {
-            let (tablebase, piece_count, opposite_tablebase, opposite_piece_count) = if !is_inverse {
-                (&mut base_tablebase, base_piece_count, &mut inverse_tablebase, inverse_piece_count)
+    while let Some((before_move_index, is_inverse)) = queue.pop_front() {
+        let (tb, isset, precomputed_moves, opposite_tb, opposite_isset) = if is_inverse {
+            (&mut *inverse_tb, &mut inverse_isset, inverse_precomputed_moves, &*forward_tb, &forward_isset)
+        } else {
+            (&mut *forward_tb, &mut forward_isset, forward_precomputed_moves, &*inverse_tb, &inverse_isset)
+        };
+        if isset[before_move_index] {
+            continue;
+        }
+
+        let mut best = Some(WDL::Loss);
+        for &after_move_index in &precomputed_moves.moves[before_move_index] {
+            let wdl = if opposite_isset[after_move_index] {
+                Some(-opposite_tb.wdl[after_move_index])
             } else {
-                (&mut inverse_tablebase, inverse_piece_count, &mut base_tablebase, base_piece_count)
+                None
             };
-            let mut board = position_index::index_to_board(target_after_move_index as u64, piece_count);
-            for from_y in 0..9 {
-                for from_x in 0..9 {
-                    if let Cell::Occupied(Player::Red, from_piece) = board.get(from_x, from_y) {
-                        for (to_x, to_y) in AdjacentLocs::new(from_x, from_y) {
-                            if board.get(to_x, to_y) != Cell::Empty { continue; }
-                            if (to_x, to_y) == Position::corner_goal(Player::Red) { continue; }
-                            *board.get_mut(from_x, from_y) = Cell::Empty;
-                            *board.get_mut(to_x, to_y) = Cell::Occupied(Player::Red, from_piece);
-                            board.invert_perspective();
-                            let undo_normalize = normalization::normalize_board(
-                                &mut board, piece_count.players_flipped());
 
-                            let before_move_index =
-                                position_index::board_to_index(&board, opposite_piece_count) as usize;
-                            if !opposite_tablebase[before_move_index].is_valid() {
-                                let mut position = Position::from_board_and_player(board.clone(), Player::Blue);
-                                let mut best = WDLZ::loss();
-                                for m in position.legal_moves().collect::<Vec<_>>() {
-                                    let undo_move = position.make_move(m);
-                                    let score = match position.get_outcome() {
-                                        Some(Outcome::Win(Player::Blue)) => WDLZ::win_in(1),
-                                        Some(Outcome::Win(Player::Red)) => unreachable!(),
-                                        Some(Outcome::Draw) => unreachable!(),
-                                        None => {
-                                            let undo_normalize = normalization::normalize_position(&mut position);
-                                            let after_move_index = position_index::board_to_index(
-                                                &position.board, undo_normalize.piece_count) as usize;
-                                            let mut score = if m.is_capture {
-                                                tablebases[&undo_normalize.piece_count][after_move_index]
-                                            } else {
-                                                tablebase[after_move_index]
-                                            };
-                                            if score.is_valid() {
-                                                score = -score.add_ply();
-                                            }
-                                            normalization::undo_normalize_position(&mut position, undo_normalize);
-                                            score
-                                        },
-                                    };
-                                    if score.is_valid() {
-                                        if score.is_win() || (best.is_valid() && score > best) {
-                                            best = score;
-                                        }
-                                    } else if best.is_valid() && !best.is_win() {
-                                        best = WDLZ::invalid();
-                                    }
-
-                                    position.undo_move(undo_move);
-                                }
-                                if best.is_valid() {
-                                    opposite_tablebase[before_move_index] = best;
-                                    next_queue.push((before_move_index, !is_inverse));
-                                }
-                            }
-
-                            normalization::undo_normalize_board(&mut board, undo_normalize);
-                            board.invert_perspective();
-                            *board.get_mut(to_x, to_y) = Cell::Empty;
-                            *board.get_mut(from_x, from_y) = Cell::Occupied(Player::Red, from_piece);
-                        }
-                    }
-                }
+            best = match (best, wdl) {
+                (_, Some(WDL::Win)) => Some(WDL::Win),
+                (Some(WDL::Win), None) => Some(WDL::Win),
+                (_, None) => None,
+                (None, _) => None,
+                (Some(a), Some(b)) => Some(std::cmp::max(a, b)),
+            };
+        }
+        if best.is_some() {
+            isset[before_move_index] = true;
+            tb.wdl[before_move_index] = best.unwrap();
+            for &after_backward_move_index in &precomputed_moves.backward_moves[before_move_index] {
+                queue.push_back((after_backward_move_index, !is_inverse));
             }
         }
     }
+}
 
-    // If we can't force a win or loss in any remaining position, it's a draw
-    for tablebase in [&mut base_tablebase, &mut inverse_tablebase] {
-        for index in 0..tablebase.len() {
-            if !tablebase[index].is_valid() {
-                tablebase[index] = WDLZ::draw();
-            }
-        }
-    }
+fn gen_tablebase(forward_piece_count: PieceCount, smaller_tablebases: &HashMap<PieceCount, MemTb>) -> (MemTb, MemTb) {
+    debug_assert!(normalization::is_count_normalized(forward_piece_count));
+    let inverse_piece_count = normalization::normalize_count(forward_piece_count.players_flipped());
 
-    (base_tablebase, inverse_tablebase)
+    let forward_len = position_index::index_count(forward_piece_count) as usize;
+    let inverse_len = position_index::index_count(inverse_piece_count) as usize;
+    debug_assert_eq!(forward_len, inverse_len);
+
+    let [forward_precomputed_moves, inverse_precomputed_moves] =
+        precompute_moves(forward_piece_count, inverse_piece_count);
+
+    let mut forward_tb = MemTb::new(forward_len);
+    let mut inverse_tb = MemTb::new(inverse_len);
+
+    compute_wdl(&mut forward_tb, &mut inverse_tb, smaller_tablebases,
+        &forward_precomputed_moves, &inverse_precomputed_moves);
+
+    // TODO - dtm & dtz
+
+    (forward_tb, inverse_tb)
 }
 
 
-fn output(tablebase: &HashMap<Position, WDLZ>, opts: &Opts) {
+fn output(piece_count: PieceCount, tablebase: &MemTb, opts: &Opts) {
     assert!(opts.format == Format::Text); // Not implemented
     let mut writer: Box<dyn io::Write> = match opts.filename.as_str() {
         "-" => Box::new(io::stdout()),
         name => Box::new(fs::File::create(name).unwrap()),
     };
-    output_text(tablebase, &mut *writer);
+    output_text(piece_count, tablebase, &mut *writer);
 }
 
-fn output_text(tablebase: &HashMap<Position, WDLZ>, writer: &mut dyn io::Write) {
-    for (pos, wldz) in tablebase {
-        let player_str = match pos.active_player {
-            Player::Blue => "b",
-            Player::Red => "r",
-        };
-        write!(*writer, "{} {player_str} {wldz}\n", pos.board.to_fen()).unwrap();
+fn output_text(piece_count: PieceCount, tablebase: &MemTb, writer: &mut dyn io::Write) {
+    for (index, &wdl) in tablebase.wdl.iter().enumerate() {
+        let board = position_index::index_to_board(index as u64, piece_count);
+        write!(*writer, "{} {wdl}\n", board.to_fen()).unwrap();
     }
-}
-
-fn output_binary(tablebase: &HashMap<Position, WDLZ>, writer: &mut dyn io::Write) {
-    panic!();
 }
 
 fn parse_command_line_args() -> Opts {
