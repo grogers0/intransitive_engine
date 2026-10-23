@@ -63,9 +63,9 @@ fn main() {
         }
     }
 
-    check_all_tablebases(&tablebases);
+    output(&tablebases, &opts);
 
-    // TODO - output
+    check_all_tablebases(&tablebases);
 
     println!("{} unique indexes", tablebases.iter().map(|(_, tablebase)| tablebase.wdl.len()).sum::<usize>());
 }
@@ -82,41 +82,50 @@ fn check_all_tablebases(tablebases: &HashMap<PieceCount, MemTb>) {
                 let expected_wdl = tablebase.wdl[before_move_index];
                 let mut best_wdl = WDL::Loss;
                 let mut min_dtz = u8::MAX;
-                let mut max_dtz = 1;
-                // TODO - check dtm & dtz
+                let mut max_dtz = 0;
+                let mut min_dtm = u16::MAX;
+                let mut max_dtm = 0;
                 for m in position.legal_moves().collect::<Vec<_>>() {
-                    let undo = position.make_move(m);
+                    let undo_move = position.make_move(m);
                     match position.get_outcome() {
                         Some(Outcome::Win(Player::Blue)) => {
+                            assert_eq!(expected_wdl, WDL::Win);
                             best_wdl = WDL::Win;
-                            let dtz = 1;
-                            min_dtz = std::cmp::min(min_dtz, dtz);
-                            max_dtz = std::cmp::max(max_dtz, dtz);
+                            min_dtz = std::cmp::min(min_dtz, 1);
+                            max_dtz = std::cmp::max(max_dtz, 1);
+
+                            min_dtm = std::cmp::min(min_dtm, 1);
+                            max_dtm = std::cmp::max(max_dtm, 1);
                         },
                         Some(Outcome::Win(Player::Red)) => unreachable!(),
                         Some(Outcome::Draw) => unreachable!(),
                         None => {
-                            let res = normalization::normalize_position(&mut position);
+                            let undo_normalize = normalization::normalize_position(&mut position);
+                            let after_move_piece_count = undo_normalize.piece_count;
                             let after_move_index = position_index::board_to_index(
-                                &position.board, res.piece_count) as usize;
-                            let wdl = -tablebases[&res.piece_count].wdl[after_move_index];
+                                &position.board, after_move_piece_count) as usize;
+                            let wdl = -tablebases[&after_move_piece_count].wdl[after_move_index];
                             best_wdl = std::cmp::max(best_wdl, wdl);
 
                             if wdl == expected_wdl {
                                 let dtz = if m.is_capture {
                                     1
                                 } else {
-                                    tablebases[&res.piece_count].dtz[after_move_index] + 1
+                                    tablebases[&after_move_piece_count].dtz[after_move_index] + 1
                                 };
                                 min_dtz = std::cmp::min(min_dtz, dtz);
                                 max_dtz = std::cmp::max(max_dtz, dtz);
+
+                                let dtm = tablebases[&after_move_piece_count].dtm[after_move_index] + 1;
+                                min_dtm = std::cmp::min(min_dtm, dtm);
+                                max_dtm = std::cmp::max(max_dtm, dtm);
                             }
 
-                            normalization::undo_normalize_position(&mut position, res);
+                            normalization::undo_normalize_position(&mut position, undo_normalize);
                         }
                     }
 
-                    position.undo_move(undo);
+                    position.undo_move(undo_move);
                 }
 
                 assert_eq!(best_wdl, expected_wdl, "{}", position.board.to_fen());
@@ -126,6 +135,12 @@ fn check_all_tablebases(tablebases: &HashMap<PieceCount, MemTb>) {
                     WDL::Loss => max_dtz,
                 };
                 assert_eq!(expected_dtz, tablebase.dtz[before_move_index], "{}", position.board.to_fen());
+                let expected_dtm = match expected_wdl {
+                    WDL::Win => min_dtm,
+                    WDL::Draw => 0,
+                    WDL::Loss => max_dtm,
+                };
+                assert_eq!(expected_dtm, tablebase.dtm[before_move_index], "{}", position.board.to_fen());
             }
         }
     }
@@ -220,7 +235,6 @@ fn compute_wdl(forward_tb: &mut MemTb, inverse_tb: &mut MemTb,
             (&mut *forward_tb, &mut forward_isset, forward_precomputed_moves)
         };
 
-        // Direct win in one
         for &before_move_index in &precomputed_moves.win_in_one {
             isset[before_move_index] = true;
             tb.wdl[before_move_index] = WDL::Win;
@@ -229,7 +243,6 @@ fn compute_wdl(forward_tb: &mut MemTb, inverse_tb: &mut MemTb,
             }
         }
 
-        // Capture into a smaller tablebase that wins
         for before_move_index in 0..tb.wdl.len() {
             for &(after_capture_piece_count, after_capture_index) in &precomputed_moves.captures[before_move_index] {
                 if smaller_tablebases[&after_capture_piece_count].wdl[after_capture_index] == WDL::Loss {
@@ -291,7 +304,6 @@ fn compute_dtz(forward_tb: &mut MemTb, inverse_tb: &mut MemTb,
             (&mut *forward_tb, forward_precomputed_moves)
         };
 
-        // Direct win in one
         for &before_move_index in &precomputed_moves.win_in_one {
             tb.dtz[before_move_index] = 1;
             for &after_backward_move_index in &precomputed_moves.backward_moves[before_move_index] {
@@ -299,7 +311,6 @@ fn compute_dtz(forward_tb: &mut MemTb, inverse_tb: &mut MemTb,
             }
         }
 
-        // Capture into a smaller tablebase that wins
         for before_move_index in 0..tb.wdl.len() {
             for &(after_capture_piece_count, after_capture_index) in &precomputed_moves.captures[before_move_index] {
                 if smaller_tablebases[&after_capture_piece_count].wdl[after_capture_index] == WDL::Loss {
@@ -360,6 +371,80 @@ fn compute_dtz(forward_tb: &mut MemTb, inverse_tb: &mut MemTb,
     }
 }
 
+fn compute_dtm(forward_tb: &mut MemTb, inverse_tb: &mut MemTb,
+    smaller_tablebases: &HashMap<PieceCount, MemTb>, forward_precomputed_moves: &PrecomputedMoves,
+    inverse_precomputed_moves: &PrecomputedMoves) {
+    let mut queue: VecDeque<(usize, bool)> = VecDeque::new();
+
+    for is_inverse in [false, true] {
+        let (tb, precomputed_moves) = if is_inverse {
+            (&mut *inverse_tb, inverse_precomputed_moves)
+        } else {
+            (&mut *forward_tb, forward_precomputed_moves)
+        };
+
+        for &before_move_index in &precomputed_moves.win_in_one {
+            tb.dtm[before_move_index] = 1;
+            for &after_backward_move_index in &precomputed_moves.backward_moves[before_move_index] {
+                queue.push_back((after_backward_move_index, !is_inverse));
+            }
+        }
+    }
+
+    while let Some((before_move_index, is_inverse)) = queue.pop_front() {
+        let (tb, precomputed_moves, opposite_tb) = if is_inverse {
+            (&mut *inverse_tb, inverse_precomputed_moves, &*forward_tb)
+        } else {
+            (&mut *forward_tb, forward_precomputed_moves, &*inverse_tb)
+        };
+
+        if tb.wdl[before_move_index] == WDL::Draw {
+            continue;
+        } else if tb.dtm[before_move_index] != 0 {
+            continue; // already set
+        }
+        let is_win = tb.wdl[before_move_index] == WDL::Win;
+
+        const MAX_DTM: u16 = u16::MAX;
+        let mut best = if is_win { MAX_DTM } else { 0 };
+        for &after_move_index in &precomputed_moves.moves[before_move_index] {
+            if tb.wdl[before_move_index] != -opposite_tb.wdl[after_move_index] { continue; }
+
+            let after_move_dtm = opposite_tb.dtm[after_move_index];
+            if is_win {
+                // minimize the dtm, unknown values are treated as high since we are breadth-first
+                if after_move_dtm != 0 {
+                    best = std::cmp::min(best, after_move_dtm + 1);
+                }
+            } else {
+                // maximize the dtm, unknown values poison the calculation
+                let after_move_dtm_plus_one = if after_move_dtm == 0 { MAX_DTM } else { after_move_dtm + 1 };
+                best = std::cmp::max(best, after_move_dtm_plus_one);
+            }
+        }
+        for &(after_capture_piece_count, after_capture_index) in &precomputed_moves.captures[before_move_index] {
+            if tb.wdl[before_move_index] !=
+                -smaller_tablebases[&after_capture_piece_count].wdl[after_capture_index] {
+                    continue;
+            }
+            let after_capture_dtm = smaller_tablebases[&after_capture_piece_count].dtm[after_capture_index] + 1;
+            if is_win {
+                best = std::cmp::min(best, after_capture_dtm);
+            } else {
+                best = std::cmp::max(best, after_capture_dtm);
+            }
+        }
+
+        if best != MAX_DTM && best != 0 {
+            tb.dtm[before_move_index] = best;
+            for &after_backward_move_index in &precomputed_moves.backward_moves[before_move_index] {
+                queue.push_back((after_backward_move_index, !is_inverse));
+            }
+        }
+    }
+}
+
+
 fn gen_tablebase(forward_piece_count: PieceCount, smaller_tablebases: &HashMap<PieceCount, MemTb>) -> (MemTb, MemTb) {
     debug_assert!(normalization::is_count_normalized(forward_piece_count));
     let inverse_piece_count = normalization::normalize_count(forward_piece_count.players_flipped());
@@ -378,26 +463,31 @@ fn gen_tablebase(forward_piece_count: PieceCount, smaller_tablebases: &HashMap<P
         &forward_precomputed_moves, &inverse_precomputed_moves);
     compute_dtz(&mut forward_tb, &mut inverse_tb, smaller_tablebases,
         &forward_precomputed_moves, &inverse_precomputed_moves);
-
-    // TODO - dtm
+    compute_dtm(&mut forward_tb, &mut inverse_tb, smaller_tablebases,
+        &forward_precomputed_moves, &inverse_precomputed_moves);
 
     (forward_tb, inverse_tb)
 }
 
 
-fn output(piece_count: PieceCount, tablebase: &MemTb, opts: &Opts) {
+fn output(tablebases: &HashMap<PieceCount, MemTb>, opts: &Opts) {
     assert!(opts.format == Format::Text); // Not implemented
     let mut writer: Box<dyn io::Write> = match opts.filename.as_str() {
         "-" => Box::new(io::stdout()),
         name => Box::new(fs::File::create(name).unwrap()),
     };
-    output_text(piece_count, tablebase, &mut *writer);
+    output_text(tablebases, &mut *writer);
 }
 
-fn output_text(piece_count: PieceCount, tablebase: &MemTb, writer: &mut dyn io::Write) {
-    for (index, &wdl) in tablebase.wdl.iter().enumerate() {
-        let board = position_index::index_to_board(index as u64, piece_count);
-        write!(*writer, "{} {wdl}\n", board.to_fen()).unwrap();
+fn output_text(tablebases: &HashMap<PieceCount, MemTb>, writer: &mut dyn io::Write) {
+    for (&piece_count, tablebase) in tablebases {
+        for index in 0..tablebase.wdl.len() {
+            let board = position_index::index_to_board(index as u64, piece_count);
+            let wdl = tablebase.wdl[index];
+            let dtz = tablebase.dtz[index];
+            let dtm = tablebase.dtm[index];
+            write!(*writer, "{} {wdl} {dtz} {dtm}\n", board.to_fen()).unwrap();
+        }
     }
 }
 
