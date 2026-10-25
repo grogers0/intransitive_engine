@@ -521,12 +521,16 @@ fn output(tablebases: &HashMap<PieceCount, MemTb>, opts: &Opts) {
 
 fn output_text(tablebases: &HashMap<PieceCount, MemTb>, writer: &mut dyn io::Write) {
     for (&piece_count, tablebase) in tablebases {
-        for index in 0..tablebase.wdl.len() {
+        let mut strings = Vec::new();
+        (0..tablebase.wdl.len()).into_par_iter().map(|index| -> String {
             let board = position_index::index_to_board(index as u64, piece_count);
             let wdl = tablebase.wdl[index];
             let dtz = tablebase.dtz[index];
             let dtm = tablebase.dtm[index];
-            write!(*writer, "{} {wdl} {dtz} {dtm}\n", board.to_fen()).unwrap();
+            format!("{} {wdl} {dtz} {dtm}\n", board.to_fen())
+        }).collect_into_vec(&mut strings);
+        for s in strings {
+            write!(*writer, "{}", s).unwrap();
         }
     }
 }
