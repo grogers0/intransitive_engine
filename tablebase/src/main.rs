@@ -2,6 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io;
 
+use rayon::prelude::*;
 use tablebase::{PieceCount, WDL, position_index, normalization};
 use base::{Outcome, Player, Position};
 
@@ -9,6 +10,7 @@ struct Opts {
     upto_pieces: u8,
     filename: String,
     format: Format,
+    num_threads: usize,
 }
 
 fn tablebase_name(pc: PieceCount) -> String {
@@ -50,6 +52,8 @@ enum Format {
 
 fn main() {
     let opts = parse_command_line_args();
+    init_threads(&opts);
+
     let mut tablebases = HashMap::new();
 
     for total_count in 0..=opts.upto_pieces {
@@ -72,9 +76,9 @@ fn main() {
 
 fn check_all_tablebases(tablebases: &HashMap<PieceCount, MemTb>) {
     if cfg!(debug_assertions) {
-        for (&piece_count, tablebase) in tablebases {
+        tablebases.par_iter().for_each(|(&piece_count, tablebase)| {
             assert!(normalization::is_count_normalized(piece_count));
-            for before_move_index in 0..tablebase.wdl.len() {
+            (0..tablebase.wdl.len()).into_par_iter().for_each(|before_move_index| {
                 let mut position = Position::from_board_and_player(
                     position_index::index_to_board(before_move_index as u64, piece_count), Player::Blue);
                 assert!(position.get_outcome().is_none());
@@ -141,8 +145,8 @@ fn check_all_tablebases(tablebases: &HashMap<PieceCount, MemTb>) {
                     WDL::Loss => max_dtm,
                 };
                 assert_eq!(expected_dtm, tablebase.dtm[before_move_index], "{}", position.board.to_fen());
-            }
-        }
+            });
+        });
     }
 }
 
@@ -158,11 +162,13 @@ struct PrecomputedMoves {
 }
 fn precompute_moves_single(piece_count: PieceCount, opposite_piece_count: PieceCount) -> PrecomputedMoves {
     let len = position_index::index_count(piece_count) as usize;
-    let mut win_in_one = Vec::new();
-    let mut captures = vec![Vec::new(); len];
-    let mut moves = vec![Vec::new(); len];
+    let mut captures: Vec<Vec<(PieceCount, usize)>> = vec![Vec::new(); len];
+    let mut moves: Vec<Vec<usize>> = vec![Vec::new(); len];
 
-    for before_move_index in 0..len {
+    let mut win_in_one = (0..len).into_par_iter()
+        .zip(captures.par_iter_mut())
+        .zip(moves.par_iter_mut())
+        .filter_map(|((before_move_index, captures_inner), moves_inner)| {
         let mut can_win_in_one = false;
         let mut position = Position::from_board_and_player(
             position_index::index_to_board(before_move_index as u64, piece_count), Player::Blue);
@@ -177,10 +183,10 @@ fn precompute_moves_single(piece_count: PieceCount, opposite_piece_count: PieceC
                     let after_move_index = position_index::board_to_index(
                         &position.board, undo_normalize.piece_count) as usize;
                     if m.is_capture {
-                        captures[before_move_index].push((undo_normalize.piece_count, after_move_index));
+                        captures_inner.push((undo_normalize.piece_count, after_move_index));
                     } else {
                         debug_assert_eq!(opposite_piece_count, undo_normalize.piece_count);
-                        moves[before_move_index].push(after_move_index);
+                        moves_inner.push(after_move_index);
                     }
 
                     normalization::undo_normalize_position(&mut position, undo_normalize);
@@ -189,14 +195,24 @@ fn precompute_moves_single(piece_count: PieceCount, opposite_piece_count: PieceC
 
             position.undo_move(undo_move);
         }
-
-        if can_win_in_one {
-            win_in_one.push(before_move_index);
+        if can_win_in_one { Some(before_move_index) } else { None }
+    })
+    .fold(|| Vec::new(), |mut acc, before_move_index| {
+        acc.push(before_move_index);
+        acc
+    })
+    .reduce(|| Vec::new(), |mut a, mut b| {
+        if a.len() > b.len() {
+            a.extend(b);
+            a
+        } else {
+            b.extend(a);
+            b
         }
-    }
+    });
 
     // To allow binary search during DTM calculation
-    win_in_one.sort();
+    win_in_one.sort_unstable();
 
     PrecomputedMoves { win_in_one, captures, moves, backward_moves: Vec::new() }
 }
@@ -520,6 +536,7 @@ fn parse_command_line_args() -> Opts {
         upto_pieces: 0,
         filename: "-".to_string(),
         format: Format::Text,
+        num_threads: 0, // If 0, num_cpus is used
     };
 
     let mut args = std::env::args();
@@ -533,15 +550,25 @@ fn parse_command_line_args() -> Opts {
                 "text" | "fen" | "txt" => Format::Text,
                 f => panic!("unknown output format: {}", f),
             },
+            "--threads" => opts.num_threads = args.next().unwrap().parse().unwrap(),
             _ => {
                 panic!("unknown command line argument \"{}\"", token);
             },
         };
     }
 
-    if opts.upto_pieces <= 1 {
-        panic!("must specify number of pieces greater than 1");
-    }
     opts
+}
+
+fn init_threads(opts: &Opts) {
+    let actual_threads = if opts.num_threads != 0 {
+        opts.num_threads
+    } else {
+        std::thread::available_parallelism().unwrap().get()
+    };
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(actual_threads)
+        .build_global()
+        .unwrap();
 }
 

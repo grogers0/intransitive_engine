@@ -18,4 +18,4 @@ overflow-checks = true
 base = { path = "base" }
 search = { path = "search" }
 rand = "0.10"
-num_cpus = "1"
+rayon = "1.12"
