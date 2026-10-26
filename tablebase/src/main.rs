@@ -1,6 +1,7 @@
 use std::collections::{HashMap, VecDeque};
+use std::cmp;
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 
 use rayon::prelude::*;
 use tablebase::{PieceCount, WDL, position_index, normalization};
@@ -9,14 +10,14 @@ use base::{Outcome, Player, Position};
 struct Opts {
     upto_pieces: u8,
     enable_dtm: bool,
-    output_filename: String,
+    output_dir: String,
     output_format: OutputFormat,
     num_threads: usize,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
 enum OutputFormat {
-    Blackhole, Binary, Text,
+    Blackhole, Binary, Text, ZlibCompressed,
 }
 
 
@@ -116,9 +117,9 @@ fn main() {
         }
     }
 
-    output(&tablebases, &opts);
-
     check_all_tablebases(&tablebases, opts.enable_dtm);
+
+    output(&tablebases, &opts);
 
     println!("{} unique indexes", tablebases.iter().map(|(_, tablebase)| tablebase.wdl.len()).sum::<usize>());
 }
@@ -144,11 +145,11 @@ fn check_all_tablebases(tablebases: &HashMap<PieceCount, MemTb>, enable_dtm: boo
                         Some(Outcome::Win(Player::Blue)) => {
                             assert_eq!(expected_wdl, WDL::Win);
                             best_wdl = WDL::Win;
-                            min_dtz = std::cmp::min(min_dtz, 1);
-                            max_dtz = std::cmp::max(max_dtz, 1);
+                            min_dtz = cmp::min(min_dtz, 1);
+                            max_dtz = cmp::max(max_dtz, 1);
 
-                            min_dtm = std::cmp::min(min_dtm, 1);
-                            max_dtm = std::cmp::max(max_dtm, 1);
+                            min_dtm = cmp::min(min_dtm, 1);
+                            max_dtm = cmp::max(max_dtm, 1);
                         },
                         Some(Outcome::Win(Player::Red)) => unreachable!(),
                         Some(Outcome::Draw) => unreachable!(),
@@ -163,7 +164,7 @@ fn check_all_tablebases(tablebases: &HashMap<PieceCount, MemTb>, enable_dtm: boo
                             let after_move_index = position_index::board_to_index(
                                 &position.board, after_move_piece_count) as usize;
                             let wdl = -tablebases[&after_move_piece_count].wdl.get(after_move_index);
-                            best_wdl = std::cmp::max(best_wdl, wdl);
+                            best_wdl = cmp::max(best_wdl, wdl);
 
                             if wdl == expected_wdl {
                                 let dtz = if m.is_capture {
@@ -171,14 +172,14 @@ fn check_all_tablebases(tablebases: &HashMap<PieceCount, MemTb>, enable_dtm: boo
                                 } else {
                                     tablebases[&after_move_piece_count].dtz[after_move_index] + 1
                                 };
-                                min_dtz = std::cmp::min(min_dtz, dtz);
-                                max_dtz = std::cmp::max(max_dtz, dtz);
+                                min_dtz = cmp::min(min_dtz, dtz);
+                                max_dtz = cmp::max(max_dtz, dtz);
 
                                 if enable_dtm {
                                     let dtm = tablebases[&after_move_piece_count]
                                         .dtm[after_move_index] + 1;
-                                    min_dtm = std::cmp::min(min_dtm, dtm);
-                                    max_dtm = std::cmp::max(max_dtm, dtm);
+                                    min_dtm = cmp::min(min_dtm, dtm);
+                                    max_dtm = cmp::max(max_dtm, dtm);
                                 }
                             }
 
@@ -352,7 +353,7 @@ fn compute_wdl(forward_tb: &mut MemTb, inverse_tb: &mut MemTb,
                 (Some(WDL::Win), None) => Some(WDL::Win),
                 (_, None) => None,
                 (None, _) => None,
-                (Some(a), Some(b)) => Some(std::cmp::max(a, b)),
+                (Some(a), Some(b)) => Some(cmp::max(a, b)),
             };
         }
         if let Some(wdl) = best {
@@ -427,12 +428,12 @@ fn compute_dtz(forward_tb: &mut MemTb, inverse_tb: &mut MemTb,
             if is_win {
                 // minimize the dtz, unknown values are treated as high since we are breadth-first
                 if after_move_dtz != 0 {
-                    best = std::cmp::min(best, after_move_dtz + 1);
+                    best = cmp::min(best, after_move_dtz + 1);
                 }
             } else {
                 // maximize the dtz, unknown values poison the calculation
                 let after_move_dtz_plus_one = if after_move_dtz == 0 { MAX_DTZ } else { after_move_dtz + 1 };
-                best = std::cmp::max(best, after_move_dtz_plus_one);
+                best = cmp::max(best, after_move_dtz_plus_one);
             }
         }
         if best != MAX_DTZ {
@@ -513,12 +514,12 @@ fn compute_dtm(forward_tb: &mut MemTb, inverse_tb: &mut MemTb,
             if is_win {
                 // minimize the dtm, unknown values are treated as high since we are breadth-first
                 if after_move_dtm != 0 {
-                    best = std::cmp::min(best, after_move_dtm + 1);
+                    best = cmp::min(best, after_move_dtm + 1);
                 }
             } else {
                 // maximize the dtm, unknown values poison the calculation
                 let after_move_dtm_plus_one = if after_move_dtm == 0 { MAX_DTM } else { after_move_dtm + 1 };
-                best = std::cmp::max(best, after_move_dtm_plus_one);
+                best = cmp::max(best, after_move_dtm_plus_one);
             }
         }
         for &(after_capture_piece_count, after_capture_index) in &precomputed_moves.captures[before_move_index] {
@@ -528,9 +529,9 @@ fn compute_dtm(forward_tb: &mut MemTb, inverse_tb: &mut MemTb,
             }
             let after_capture_dtm = smaller_tablebases[&after_capture_piece_count].dtm[after_capture_index] + 1;
             if is_win {
-                best = std::cmp::min(best, after_capture_dtm);
+                best = cmp::min(best, after_capture_dtm);
             } else {
-                best = std::cmp::max(best, after_capture_dtm);
+                best = cmp::max(best, after_capture_dtm);
             }
         }
 
@@ -576,22 +577,33 @@ fn gen_tablebase(forward_piece_count: PieceCount, smaller_tablebases: &HashMap<P
 
 
 fn output(tablebases: &HashMap<PieceCount, MemTb>, opts: &Opts) {
-    if opts.output_format == OutputFormat::Blackhole {
-        return;
+    match opts.output_format {
+        OutputFormat::Blackhole => (), // Output nothing
+        OutputFormat::Binary => {
+            for (&piece_count, tablebase) in tablebases {
+                output_binary(piece_count, tablebase, opts).unwrap();
+            }
+        },
+        OutputFormat::Text => {
+            for (&piece_count, tablebase) in tablebases {
+                output_text(piece_count, tablebase, opts).unwrap();
+            }
+        },
+        OutputFormat::ZlibCompressed => unimplemented!(),
     }
-
-    assert!(opts.output_format == OutputFormat::Text); // Not implemented
-    let mut writer: Box<dyn io::Write> = match opts.output_filename.as_str() {
-        "-" => Box::new(io::stdout()),
-        name => Box::new(fs::File::create(name).unwrap()),
-    };
-    output_text(tablebases, opts, &mut *writer);
 }
 
-fn output_text(tablebases: &HashMap<PieceCount, MemTb>, opts: &Opts, writer: &mut dyn io::Write) {
-    for (&piece_count, tablebase) in tablebases {
-        let mut strings = Vec::new();
-        (0..tablebase.wdl.len()).into_par_iter().map(|index| -> String {
+fn output_text(piece_count: PieceCount, tablebase: &MemTb, opts: &Opts) -> io::Result<()> {
+    fs::create_dir_all(&format!("{}", opts.output_dir))?;
+    let mut file = fs::File::create(
+        &format!("{}/{}.txt", opts.output_dir, tablebase_name(piece_count)))?;
+
+    let len = tablebase.wdl.len();
+    const CHUNK_SIZE: usize = 1 << 16;
+    for chunk_index in 0..((len + CHUNK_SIZE - 1) / CHUNK_SIZE) {
+        let min_index = chunk_index * CHUNK_SIZE;
+        let max_index = cmp::min(min_index + CHUNK_SIZE, len);
+        let s = (min_index..max_index).into_par_iter().map(|index| {
             let board = position_index::index_to_board(index as u64, piece_count);
             let wdl = tablebase.wdl.get(index);
             let dtz = tablebase.dtz[index];
@@ -601,19 +613,48 @@ fn output_text(tablebases: &HashMap<PieceCount, MemTb>, opts: &Opts, writer: &mu
             } else {
                 format!("{} {wdl} {dtz}\n", board.to_fen())
             }
-        }).collect_into_vec(&mut strings);
-        for s in strings {
-            write!(*writer, "{}", s).unwrap();
-        }
+        }).reduce(|| String::new(), |a, b| { a + &b });
+        file.write_all(s.as_bytes())?;
     }
+    Ok(())
+}
+
+fn output_binary(piece_count: PieceCount, tablebase: &MemTb, opts: &Opts) -> io::Result<()> {
+    fs::create_dir_all(&format!("{}", opts.output_dir))?;
+    let len = (tablebase.wdl.len() as u64).to_le_bytes();
+    {
+        let mut file = fs::File::create(
+            format!("{}/{}.tbw", opts.output_dir, tablebase_name(piece_count)))?;
+        file.write_all(&tablebase.wdl.bytes)?;
+        file.write_all(&len)?;
+        file.write_all(&[4u8, 0u8])?;
+    }
+    {
+        let mut file = fs::File::create(
+            format!("{}/{}.tbz", opts.output_dir, tablebase_name(piece_count)))?;
+        file.write_all(tablebase.dtz.as_slice())?;
+        file.write_all(&len)?;
+        file.write_all(&[8u8, 0u8])?;
+    }
+    if opts.enable_dtm {
+        let mut file = fs::File::create(
+            format!("{}/{}.tbm", opts.output_dir, tablebase_name(piece_count)))?;
+        // TODO - probably faster way to do this
+        for &v in &tablebase.dtm {
+            file.write_all(&v.to_le_bytes())?;
+        }
+        file.write_all(&len)?;
+        file.write_all(&[16u8, 0u8])?;
+    }
+    Ok(())
 }
 
 fn parse_command_line_args() -> Opts {
     let mut opts = Opts {
         upto_pieces: 0,
         enable_dtm: false,
-        output_filename: "-".to_string(),
-        output_format: OutputFormat::Blackhole, // TODO - default to binary when implemented
+        output_dir: "data/tablebases".to_string(),
+        output_format: OutputFormat::Binary, // TODO - default to ZlibCompressed when implemented
         num_threads: 0, // If 0, num_cpus is used
     };
 
@@ -625,13 +666,14 @@ fn parse_command_line_args() -> Opts {
                 opts.upto_pieces = args.next().unwrap().parse().unwrap();
             },
             "--enable_dtm" | "--enable-dtm" | "--dtm" => opts.enable_dtm = true,
-            "--filename" | "--output_filename" | "--output-filename" => {
-                opts.output_filename = args.next().unwrap().to_string();
+            "--directory" | "--dir" | "--output_dir" | "--output-dir" => {
+                opts.output_dir = args.next().unwrap().to_string();
             },
             "--format" | "--output_format" | "--output-format" => {
                 opts.output_format = match args.next().unwrap().as_str() {
                     "none" | "blackhole" => OutputFormat::Blackhole,
                     "binary" | "bin" => OutputFormat::Binary,
+                    "compressed" | "zlib-compressed" => OutputFormat::ZlibCompressed,
                     "text" | "fen" | "txt" => OutputFormat::Text,
                     f => panic!("unknown output format: {}", f),
                 };
