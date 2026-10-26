@@ -104,7 +104,12 @@ fn check_all_tablebases(tablebases: &HashMap<PieceCount, MemTb>) {
                         Some(Outcome::Win(Player::Red)) => unreachable!(),
                         Some(Outcome::Draw) => unreachable!(),
                         None => {
-                            let undo_normalize = normalization::normalize_position(&mut position);
+                            let pre_normalize_piece_count = if m.is_capture {
+                                PieceCount::from_board(&position.board)
+                            } else {
+                                piece_count
+                            };
+                            let undo_normalize = normalization::normalize_position(&mut position, pre_normalize_piece_count);
                             let after_move_piece_count = undo_normalize.piece_count;
                             let after_move_index = position_index::board_to_index(
                                 &position.board, after_move_piece_count) as usize;
@@ -179,7 +184,12 @@ fn precompute_moves_single(piece_count: PieceCount, opposite_piece_count: PieceC
                 Some(Outcome::Win(Player::Red)) => unreachable!(),
                 Some(Outcome::Draw) => unreachable!(),
                 None => {
-                    let undo_normalize = normalization::normalize_position(&mut position);
+                    let pre_normalize_piece_count = if m.is_capture {
+                        PieceCount::from_board(&position.board)
+                    } else {
+                        piece_count
+                    };
+                    let undo_normalize = normalization::normalize_position(&mut position, pre_normalize_piece_count);
                     let after_move_index = position_index::board_to_index(
                         &position.board, undo_normalize.piece_count) as usize;
                     if m.is_capture {

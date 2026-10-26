@@ -42,7 +42,8 @@ pub fn is_count_normalized(pc: PieceCount) -> bool {
 }
 
 // WARNING - does not update zobrist hashes, do not use it in the transposition table until undo!
-pub fn normalize_position(position: &mut Position) -> NormalizeResult {
+pub fn normalize_position(position: &mut Position, mut piece_count: PieceCount) -> NormalizeResult {
+    debug_assert_eq!(piece_count, PieceCount::from_board(&position.board));
     let mut res = NormalizeResult {
         piece_count: PieceCount::ZERO,
         invert_player: false,
@@ -52,8 +53,8 @@ pub fn normalize_position(position: &mut Position) -> NormalizeResult {
     if position.active_player == Player::Red {
         res.invert_player = true;
         invert_player(position);
+        piece_count = piece_count.players_flipped();
     }
-    let piece_count = PieceCount::from_board(&position.board);
     let piece_shift = calc_piece_shift(piece_count);
     res.piece_shift = piece_shift.invert();
     shift_pieces(&mut position.board, piece_shift);
@@ -179,7 +180,8 @@ mod tests {
     fn test_initial() {
         let mut pos = Position::initial();
         assert!(!is_normalized(&pos)); // More paper than rock
-        let res = normalize_position(&mut pos);
+        let piece_count = PieceCount::from_board(&pos.board);
+        let res = normalize_position(&mut pos, piece_count);
         assert_eq!(res, NormalizeResult {
             piece_count: PieceCount {
                 blue_rock: 4, blue_paper: 3, blue_scissors: 3,
@@ -215,7 +217,8 @@ mod tests {
         }
 
         let pos2 = pos.clone();
-        let res = normalize_position(&mut pos);
+        let piece_count = PieceCount::from_board(&pos.board);
+        let res = normalize_position(&mut pos, piece_count);
         undo_normalize_position(&mut pos, res);
         assert_eq!(pos, pos2);
     }
