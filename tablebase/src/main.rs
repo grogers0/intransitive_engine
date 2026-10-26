@@ -8,10 +8,17 @@ use base::{Outcome, Player, Position};
 
 struct Opts {
     upto_pieces: u8,
-    filename: String,
-    format: Format,
+    enable_dtm: bool,
+    output_filename: String,
+    output_format: OutputFormat,
     num_threads: usize,
 }
+
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+enum OutputFormat {
+    Blackhole, Binary, Text,
+}
+
 
 fn tablebase_name(pc: PieceCount) -> String {
     let cap = pc.blue_rock + pc.blue_paper + pc.blue_scissors +
@@ -35,20 +42,15 @@ struct MemTb {
 }
 
 impl MemTb {
-    fn new(len: usize) -> MemTb {
+    fn new(len: usize, enable_dtm: bool) -> MemTb {
+        let dtm = if enable_dtm { vec![0; len] } else { Vec::new() };
         MemTb {
             wdl: vec![WDL::Draw; len],
             dtz: vec![0; len],
-            dtm: vec![0; len],
+            dtm,
         }
     }
 }
-
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
-enum Format {
-    Binary, Text,
-}
-
 
 fn main() {
     let opts = parse_command_line_args();
@@ -60,7 +62,7 @@ fn main() {
         for piece_count in PieceCount::enumerate_useful_piece_counts(total_count) {
             let piece_count = normalization::normalize_count(piece_count);
             if tablebases.contains_key(&piece_count) { continue; }
-            let (tb1, tb2) = gen_tablebase(piece_count, &tablebases);
+            let (tb1, tb2) = gen_tablebase(piece_count, &tablebases, opts.enable_dtm);
             tablebases.insert(piece_count, tb1);
             let inverse_piece_count = normalization::normalize_count(piece_count.players_flipped());
             tablebases.insert(inverse_piece_count, tb2);
@@ -69,12 +71,12 @@ fn main() {
 
     output(&tablebases, &opts);
 
-    check_all_tablebases(&tablebases);
+    check_all_tablebases(&tablebases, opts.enable_dtm);
 
     println!("{} unique indexes", tablebases.iter().map(|(_, tablebase)| tablebase.wdl.len()).sum::<usize>());
 }
 
-fn check_all_tablebases(tablebases: &HashMap<PieceCount, MemTb>) {
+fn check_all_tablebases(tablebases: &HashMap<PieceCount, MemTb>, enable_dtm: bool) {
     if cfg!(debug_assertions) {
         tablebases.par_iter().for_each(|(&piece_count, tablebase)| {
             assert!(normalization::is_count_normalized(piece_count));
@@ -125,9 +127,12 @@ fn check_all_tablebases(tablebases: &HashMap<PieceCount, MemTb>) {
                                 min_dtz = std::cmp::min(min_dtz, dtz);
                                 max_dtz = std::cmp::max(max_dtz, dtz);
 
-                                let dtm = tablebases[&after_move_piece_count].dtm[after_move_index] + 1;
-                                min_dtm = std::cmp::min(min_dtm, dtm);
-                                max_dtm = std::cmp::max(max_dtm, dtm);
+                                if enable_dtm {
+                                    let dtm = tablebases[&after_move_piece_count]
+                                        .dtm[after_move_index] + 1;
+                                    min_dtm = std::cmp::min(min_dtm, dtm);
+                                    max_dtm = std::cmp::max(max_dtm, dtm);
+                                }
                             }
 
                             normalization::undo_normalize_position(&mut position, undo_normalize);
@@ -144,12 +149,14 @@ fn check_all_tablebases(tablebases: &HashMap<PieceCount, MemTb>) {
                     WDL::Loss => max_dtz,
                 };
                 assert_eq!(expected_dtz, tablebase.dtz[before_move_index], "{}", position.board.to_fen());
-                let expected_dtm = match expected_wdl {
-                    WDL::Win => min_dtm,
-                    WDL::Draw => 0,
-                    WDL::Loss => max_dtm,
-                };
-                assert_eq!(expected_dtm, tablebase.dtm[before_move_index], "{}", position.board.to_fen());
+                if enable_dtm {
+                    let expected_dtm = match expected_wdl {
+                        WDL::Win => min_dtm,
+                        WDL::Draw => 0,
+                        WDL::Loss => max_dtm,
+                    };
+                    assert_eq!(expected_dtm, tablebase.dtm[before_move_index], "{}", position.board.to_fen());
+                }
             });
         });
     }
@@ -495,7 +502,8 @@ fn compute_dtm(forward_tb: &mut MemTb, inverse_tb: &mut MemTb,
 }
 
 
-fn gen_tablebase(forward_piece_count: PieceCount, smaller_tablebases: &HashMap<PieceCount, MemTb>) -> (MemTb, MemTb) {
+fn gen_tablebase(forward_piece_count: PieceCount, smaller_tablebases: &HashMap<PieceCount, MemTb>,
+    enable_dtm: bool) -> (MemTb, MemTb) {
     debug_assert!(normalization::is_count_normalized(forward_piece_count));
     let inverse_piece_count = normalization::normalize_count(forward_piece_count.players_flipped());
 
@@ -506,38 +514,48 @@ fn gen_tablebase(forward_piece_count: PieceCount, smaller_tablebases: &HashMap<P
     let [forward_precomputed_moves, inverse_precomputed_moves] =
         precompute_moves(forward_piece_count, inverse_piece_count);
 
-    let mut forward_tb = MemTb::new(forward_len);
-    let mut inverse_tb = MemTb::new(inverse_len);
+    let mut forward_tb = MemTb::new(forward_len, enable_dtm);
+    let mut inverse_tb = MemTb::new(inverse_len, enable_dtm);
 
     compute_wdl(&mut forward_tb, &mut inverse_tb, smaller_tablebases,
         &forward_precomputed_moves, &inverse_precomputed_moves);
     compute_dtz(&mut forward_tb, &mut inverse_tb, smaller_tablebases,
         &forward_precomputed_moves, &inverse_precomputed_moves);
-    compute_dtm(&mut forward_tb, &mut inverse_tb, smaller_tablebases,
-        &forward_precomputed_moves, &inverse_precomputed_moves);
+    if enable_dtm {
+        compute_dtm(&mut forward_tb, &mut inverse_tb, smaller_tablebases,
+            &forward_precomputed_moves, &inverse_precomputed_moves);
+    }
 
     (forward_tb, inverse_tb)
 }
 
 
 fn output(tablebases: &HashMap<PieceCount, MemTb>, opts: &Opts) {
-    assert!(opts.format == Format::Text); // Not implemented
-    let mut writer: Box<dyn io::Write> = match opts.filename.as_str() {
+    if opts.output_format == OutputFormat::Blackhole {
+        return;
+    }
+
+    assert!(opts.output_format == OutputFormat::Text); // Not implemented
+    let mut writer: Box<dyn io::Write> = match opts.output_filename.as_str() {
         "-" => Box::new(io::stdout()),
         name => Box::new(fs::File::create(name).unwrap()),
     };
-    output_text(tablebases, &mut *writer);
+    output_text(tablebases, opts, &mut *writer);
 }
 
-fn output_text(tablebases: &HashMap<PieceCount, MemTb>, writer: &mut dyn io::Write) {
+fn output_text(tablebases: &HashMap<PieceCount, MemTb>, opts: &Opts, writer: &mut dyn io::Write) {
     for (&piece_count, tablebase) in tablebases {
         let mut strings = Vec::new();
         (0..tablebase.wdl.len()).into_par_iter().map(|index| -> String {
             let board = position_index::index_to_board(index as u64, piece_count);
             let wdl = tablebase.wdl[index];
             let dtz = tablebase.dtz[index];
-            let dtm = tablebase.dtm[index];
-            format!("{} {wdl} {dtz} {dtm}\n", board.to_fen())
+            if opts.enable_dtm {
+                let dtm = tablebase.dtm[index];
+                format!("{} {wdl} {dtz} {dtm}\n", board.to_fen())
+            } else {
+                format!("{} {wdl} {dtz}\n", board.to_fen())
+            }
         }).collect_into_vec(&mut strings);
         for s in strings {
             write!(*writer, "{}", s).unwrap();
@@ -548,8 +566,9 @@ fn output_text(tablebases: &HashMap<PieceCount, MemTb>, writer: &mut dyn io::Wri
 fn parse_command_line_args() -> Opts {
     let mut opts = Opts {
         upto_pieces: 0,
-        filename: "-".to_string(),
-        format: Format::Text,
+        enable_dtm: false,
+        output_filename: "-".to_string(),
+        output_format: OutputFormat::Blackhole, // TODO - default to binary when implemented
         num_threads: 0, // If 0, num_cpus is used
     };
 
@@ -557,14 +576,24 @@ fn parse_command_line_args() -> Opts {
     args.next(); // Skip binary name
     while let Some(token) = args.next() {
         match token.as_str() {
-            "--upto_pieces" | "--upto" => opts.upto_pieces = args.next().unwrap().parse().unwrap(),
-            "--filename" => opts.filename = args.next().unwrap().to_string(),
-            "--format" => opts.format = match args.next().unwrap().as_str() {
-                "binary" | "bin" => Format::Binary,
-                "text" | "fen" | "txt" => Format::Text,
-                f => panic!("unknown output format: {}", f),
+            "--upto_pieces" | "--upto-pieces" | "--upto" => {
+                opts.upto_pieces = args.next().unwrap().parse().unwrap();
             },
-            "--threads" => opts.num_threads = args.next().unwrap().parse().unwrap(),
+            "--enable_dtm" | "--enable-dtm" | "--dtm" => opts.enable_dtm = true,
+            "--filename" | "--output_filename" | "--output-filename" => {
+                opts.output_filename = args.next().unwrap().to_string();
+            },
+            "--format" | "--output_format" | "--output-format" => {
+                opts.output_format = match args.next().unwrap().as_str() {
+                    "none" | "blackhole" => OutputFormat::Blackhole,
+                    "binary" | "bin" => OutputFormat::Binary,
+                    "text" | "fen" | "txt" => OutputFormat::Text,
+                    f => panic!("unknown output format: {}", f),
+                };
+            },
+            "--threads" | "--num_threads" | "--num-threads" => {
+                opts.num_threads = args.next().unwrap().parse().unwrap();
+            },
             _ => {
                 panic!("unknown command line argument \"{}\"", token);
             },
