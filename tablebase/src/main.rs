@@ -36,7 +36,7 @@ fn tablebase_name(pc: PieceCount) -> String {
 // NOTE - all vectors will have the same length
 #[derive(Clone)]
 struct MemTb {
-    wdl: Vec<WDL>,
+    wdl: WdlVec,
     dtz: Vec<u8>,
     dtm: Vec<u16>,
 }
@@ -45,10 +45,57 @@ impl MemTb {
     fn new(len: usize, enable_dtm: bool) -> MemTb {
         let dtm = if enable_dtm { vec![0; len] } else { Vec::new() };
         MemTb {
-            wdl: vec![WDL::Draw; len],
+            wdl: WdlVec::new(len),
             dtz: vec![0; len],
             dtm,
         }
+    }
+}
+
+#[derive(Clone)]
+struct WdlVec {
+    len: usize,
+    bytes: Box<[u8]>,
+}
+
+impl WdlVec {
+    fn new(len: usize) -> WdlVec {
+        let bytes = vec![0xff; (len + 3) / 4].into_boxed_slice();
+        WdlVec { len, bytes }
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn get_option(&self, idx: usize) -> Option<WDL> {
+        debug_assert!(idx < self.len);
+        let byte_idx = idx >> 2;
+        let bit_idx = (idx & 0x03) << 1;
+        match (self.bytes[byte_idx] >> bit_idx) & 0x03 {
+            0 => Some(WDL::Loss),
+            1 => Some(WDL::Draw),
+            2 => Some(WDL::Win),
+            3 => None,
+            _ => unreachable!(),
+        }
+    }
+
+    fn get(&self, idx: usize) -> WDL {
+        self.get_option(idx).unwrap()
+    }
+
+    fn set(&mut self, idx: usize, wdl: WDL) {
+        debug_assert!(idx < self.len);
+        let byte_idx = idx >> 2;
+        let bit_idx = (idx & 0x03) << 1;
+        let mut byte = self.bytes[byte_idx];
+        byte &= !(0x03 << bit_idx);
+        byte |= match wdl { WDL::Loss => 0, WDL::Draw => 1, WDL::Win => 2 } << bit_idx;
+        // Shouldn't overwrite unless it's unset (setting to same value is ok)
+        debug_assert!(self.bytes[byte_idx] == byte ||
+            (self.bytes[byte_idx] >> bit_idx) & 0x03 == 0x03);
+        self.bytes[byte_idx] = byte;
     }
 }
 
@@ -85,7 +132,7 @@ fn check_all_tablebases(tablebases: &HashMap<PieceCount, MemTb>, enable_dtm: boo
                     position_index::index_to_board(before_move_index as u64, piece_count), Player::Blue);
                 assert!(position.get_outcome().is_none());
 
-                let expected_wdl = tablebase.wdl[before_move_index];
+                let expected_wdl = tablebase.wdl.get(before_move_index);
                 let mut best_wdl = WDL::Loss;
                 let mut min_dtz = u8::MAX;
                 let mut max_dtz = 0;
@@ -115,7 +162,7 @@ fn check_all_tablebases(tablebases: &HashMap<PieceCount, MemTb>, enable_dtm: boo
                             let after_move_piece_count = undo_normalize.piece_count;
                             let after_move_index = position_index::board_to_index(
                                 &position.board, after_move_piece_count) as usize;
-                            let wdl = -tablebases[&after_move_piece_count].wdl[after_move_index];
+                            let wdl = -tablebases[&after_move_piece_count].wdl.get(after_move_index);
                             best_wdl = std::cmp::max(best_wdl, wdl);
 
                             if wdl == expected_wdl {
@@ -258,22 +305,18 @@ fn precompute_moves(forward_piece_count: PieceCount, inverse_piece_count: PieceC
 fn compute_wdl(forward_tb: &mut MemTb, inverse_tb: &mut MemTb,
     smaller_tablebases: &HashMap<PieceCount, MemTb>, forward_precomputed_moves: &PrecomputedMoves,
     inverse_precomputed_moves: &PrecomputedMoves) {
-    // If the value in tb.wdl[index] is true or not
-    let mut forward_isset = vec![false; forward_tb.wdl.len()];
-    let mut inverse_isset = vec![false; forward_tb.wdl.len()];
 
     let mut queue: VecDeque<(usize, bool)> = VecDeque::new();
 
     for is_inverse in [false, true] {
-        let (tb, isset, precomputed_moves) = if is_inverse {
-            (&mut *inverse_tb, &mut inverse_isset, inverse_precomputed_moves)
+        let (tb, precomputed_moves) = if is_inverse {
+            (&mut *inverse_tb, inverse_precomputed_moves)
         } else {
-            (&mut *forward_tb, &mut forward_isset, forward_precomputed_moves)
+            (&mut *forward_tb, forward_precomputed_moves)
         };
 
         for &before_move_index in &precomputed_moves.win_in_one {
-            isset[before_move_index] = true;
-            tb.wdl[before_move_index] = WDL::Win;
+            tb.wdl.set(before_move_index, WDL::Win);
             for &after_backward_move_index in &precomputed_moves.backward_moves[before_move_index] {
                 queue.push_back((after_backward_move_index, !is_inverse));
             }
@@ -281,9 +324,8 @@ fn compute_wdl(forward_tb: &mut MemTb, inverse_tb: &mut MemTb,
 
         for before_move_index in 0..tb.wdl.len() {
             for &(after_capture_piece_count, after_capture_index) in &precomputed_moves.captures[before_move_index] {
-                if smaller_tablebases[&after_capture_piece_count].wdl[after_capture_index] == WDL::Loss {
-                    isset[before_move_index] = true;
-                    tb.wdl[before_move_index] = WDL::Win;
+                if smaller_tablebases[&after_capture_piece_count].wdl.get(after_capture_index) == WDL::Loss {
+                    tb.wdl.set(before_move_index, WDL::Win);
                     for &after_backward_move_index in &precomputed_moves.backward_moves[before_move_index] {
                         queue.push_back((after_backward_move_index, !is_inverse));
                     }
@@ -293,23 +335,18 @@ fn compute_wdl(forward_tb: &mut MemTb, inverse_tb: &mut MemTb,
     }
 
     while let Some((before_move_index, is_inverse)) = queue.pop_front() {
-        let (tb, isset, precomputed_moves, opposite_tb, opposite_isset) = if is_inverse {
-            (&mut *inverse_tb, &mut inverse_isset, inverse_precomputed_moves, &*forward_tb, &forward_isset)
+        let (tb, precomputed_moves, opposite_tb) = if is_inverse {
+            (&mut *inverse_tb, inverse_precomputed_moves, &*forward_tb)
         } else {
-            (&mut *forward_tb, &mut forward_isset, forward_precomputed_moves, &*inverse_tb, &inverse_isset)
+            (&mut *forward_tb, forward_precomputed_moves, &*inverse_tb)
         };
-        if isset[before_move_index] {
+        if tb.wdl.get_option(before_move_index).is_some() {
             continue;
         }
 
         let mut best = Some(WDL::Loss);
         for &after_move_index in &precomputed_moves.moves[before_move_index] {
-            let wdl = if opposite_isset[after_move_index] {
-                Some(-opposite_tb.wdl[after_move_index])
-            } else {
-                None
-            };
-
+            let wdl = opposite_tb.wdl.get_option(after_move_index).map(|wdl| -wdl);
             best = match (best, wdl) {
                 (_, Some(WDL::Win)) => Some(WDL::Win),
                 (Some(WDL::Win), None) => Some(WDL::Win),
@@ -318,11 +355,19 @@ fn compute_wdl(forward_tb: &mut MemTb, inverse_tb: &mut MemTb,
                 (Some(a), Some(b)) => Some(std::cmp::max(a, b)),
             };
         }
-        if best.is_some() {
-            isset[before_move_index] = true;
-            tb.wdl[before_move_index] = best.unwrap();
+        if let Some(wdl) = best {
+            tb.wdl.set(before_move_index, wdl);
             for &after_backward_move_index in &precomputed_moves.backward_moves[before_move_index] {
                 queue.push_back((after_backward_move_index, !is_inverse));
+            }
+        }
+    }
+
+    // Anything that can't be forced into a win/loss is a draw
+    for tb in [&mut *forward_tb, &mut *inverse_tb] {
+        for index in 0..tb.wdl.len() {
+            if tb.wdl.get_option(index).is_none() {
+                tb.wdl.set(index, WDL::Draw);
             }
         }
     }
@@ -349,7 +394,7 @@ fn compute_dtz(forward_tb: &mut MemTb, inverse_tb: &mut MemTb,
 
         for before_move_index in 0..tb.wdl.len() {
             for &(after_capture_piece_count, after_capture_index) in &precomputed_moves.captures[before_move_index] {
-                if smaller_tablebases[&after_capture_piece_count].wdl[after_capture_index] == WDL::Loss {
+                if smaller_tablebases[&after_capture_piece_count].wdl.get(after_capture_index) == WDL::Loss {
                     tb.dtz[before_move_index] = 1;
                     for &after_backward_move_index in &precomputed_moves.backward_moves[before_move_index] {
                         queue.push_back((after_backward_move_index, !is_inverse));
@@ -366,17 +411,17 @@ fn compute_dtz(forward_tb: &mut MemTb, inverse_tb: &mut MemTb,
             (&mut *forward_tb, forward_precomputed_moves, &*inverse_tb)
         };
 
-        if tb.wdl[before_move_index] == WDL::Draw {
+        if tb.wdl.get(before_move_index) == WDL::Draw {
             continue;
         } else if tb.dtz[before_move_index] != 0 {
             continue; // already set
         }
-        let is_win = tb.wdl[before_move_index] == WDL::Win;
+        let is_win = tb.wdl.get(before_move_index) == WDL::Win;
 
         const MAX_DTZ: u8 = u8::MAX;
         let mut best = if is_win { MAX_DTZ } else { 1 };
         for &after_move_index in &precomputed_moves.moves[before_move_index] {
-            if tb.wdl[before_move_index] != -opposite_tb.wdl[after_move_index] { continue; }
+            if tb.wdl.get(before_move_index) != -opposite_tb.wdl.get(after_move_index) { continue; }
 
             let after_move_dtz = opposite_tb.dtz[after_move_index];
             if is_win {
@@ -421,7 +466,7 @@ fn compute_dtm(forward_tb: &mut MemTb, inverse_tb: &mut MemTb,
 
         for before_move_index in 0..tb.wdl.len() {
             for &(after_capture_piece_count, after_capture_index) in &precomputed_moves.captures[before_move_index] {
-                if smaller_tablebases[&after_capture_piece_count].wdl[after_capture_index] == WDL::Loss {
+                if smaller_tablebases[&after_capture_piece_count].wdl.get(after_capture_index) == WDL::Loss {
                     tb.dtm[before_move_index] = smaller_tablebases[&after_capture_piece_count].dtm[after_capture_index] + 1;
                     for &after_backward_move_index in &precomputed_moves.backward_moves[before_move_index] {
                         queue.push_back((after_backward_move_index, !is_inverse));
@@ -446,10 +491,10 @@ fn compute_dtm(forward_tb: &mut MemTb, inverse_tb: &mut MemTb,
             (&mut *forward_tb, forward_precomputed_moves, &*inverse_tb)
         };
 
-        if tb.wdl[before_move_index] == WDL::Draw {
+        if tb.wdl.get(before_move_index) == WDL::Draw {
             continue;
         }
-        let is_win = tb.wdl[before_move_index] == WDL::Win;
+        let is_win = tb.wdl.get(before_move_index) == WDL::Win;
 
         const MAX_DTM: u16 = u16::MAX;
         let mut best = if is_win {
@@ -462,7 +507,7 @@ fn compute_dtm(forward_tb: &mut MemTb, inverse_tb: &mut MemTb,
             0
         };
         for &after_move_index in &precomputed_moves.moves[before_move_index] {
-            if tb.wdl[before_move_index] != -opposite_tb.wdl[after_move_index] { continue; }
+            if tb.wdl.get(before_move_index) != -opposite_tb.wdl.get(after_move_index) { continue; }
 
             let after_move_dtm = opposite_tb.dtm[after_move_index];
             if is_win {
@@ -477,8 +522,8 @@ fn compute_dtm(forward_tb: &mut MemTb, inverse_tb: &mut MemTb,
             }
         }
         for &(after_capture_piece_count, after_capture_index) in &precomputed_moves.captures[before_move_index] {
-            if tb.wdl[before_move_index] !=
-                -smaller_tablebases[&after_capture_piece_count].wdl[after_capture_index] {
+            if tb.wdl.get(before_move_index) !=
+                -smaller_tablebases[&after_capture_piece_count].wdl.get(after_capture_index) {
                     continue;
             }
             let after_capture_dtm = smaller_tablebases[&after_capture_piece_count].dtm[after_capture_index] + 1;
@@ -548,7 +593,7 @@ fn output_text(tablebases: &HashMap<PieceCount, MemTb>, opts: &Opts, writer: &mu
         let mut strings = Vec::new();
         (0..tablebase.wdl.len()).into_par_iter().map(|index| -> String {
             let board = position_index::index_to_board(index as u64, piece_count);
-            let wdl = tablebase.wdl[index];
+            let wdl = tablebase.wdl.get(index);
             let dtz = tablebase.dtz[index];
             if opts.enable_dtm {
                 let dtm = tablebase.dtm[index];
