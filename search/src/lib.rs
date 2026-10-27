@@ -6,6 +6,7 @@ use base::position::Position;
 use base::{heuristic, tt};
 use base::killers::Killers;
 use base::history::HistoryTable;
+use tablebase::Tablebase;
 
 pub struct Opts {
     pub max_depth: Option<u8>,
@@ -26,12 +27,13 @@ struct State<'a> {
     pub soft_deadline: Option<Instant>,
     pub hard_deadline: Option<Instant>,
     pub tt: &'a mut tt::TranspositionTable,
+    pub tablebase: &'a Tablebase,
     pub killers: Killers,
     pub history: &'a mut HistoryTable,
 }
 
 pub fn best_move(position: &mut Position, opts: &Opts, tt: &mut tt::TranspositionTable,
-    history: &mut HistoryTable) -> Move {
+    history: &mut HistoryTable, tablebase: &Tablebase) -> Move {
     if let Some(_) = position.get_outcome() {
         return Move::invalid(); // No moves to try
     }
@@ -50,6 +52,7 @@ pub fn best_move(position: &mut Position, opts: &Opts, tt: &mut tt::Transpositio
         soft_deadline,
         hard_deadline,
         tt,
+        tablebase,
         killers: Killers::new(),
         history,
     };
@@ -77,7 +80,11 @@ pub fn best_move(position: &mut Position, opts: &Opts, tt: &mut tt::Transpositio
 
         for &m in &moves {
             let undo = state.position.make_move(m);
-            let child_result = negamax(&mut state, depth - 1, -Value::infinity(), -alpha);
+            let child_result = if let Some(v) = state.tablebase.lookup_slow(&mut state.position) {
+                v
+            } else {
+                negamax(&mut state, depth - 1, -Value::infinity(), -alpha)
+            };
             state.position.undo_move(undo);
 
             if !child_result.is_valid() {
@@ -113,7 +120,7 @@ pub fn best_move(position: &mut Position, opts: &Opts, tt: &mut tt::Transpositio
 
 // Returns {move -> score for current player}
 pub fn evaluate_moves(position: &mut Position, opts: &Opts, tt: &mut tt::TranspositionTable,
-    history: &mut HistoryTable) -> HashMap<Move, Value> {
+    history: &mut HistoryTable, tablebase: &Tablebase) -> HashMap<Move, Value> {
     if let Some(_) = position.get_outcome() {
         return HashMap::new(); // No moves to try
     }
@@ -132,6 +139,7 @@ pub fn evaluate_moves(position: &mut Position, opts: &Opts, tt: &mut tt::Transpo
         soft_deadline,
         hard_deadline,
         tt,
+        tablebase,
         killers: Killers::new(),
         history,
     };
@@ -152,7 +160,11 @@ pub fn evaluate_moves(position: &mut Position, opts: &Opts, tt: &mut tt::Transpo
                 continue;
             }
             let undo = state.position.make_move(m);
-            let child_result = negamax(&mut state, depth - 1, -Value::infinity(), Value::infinity());
+            let child_result = if let Some(v) = state.tablebase.lookup_slow(&mut state.position) {
+                v
+            } else {
+                negamax(&mut state, depth - 1, -Value::infinity(), Value::infinity())
+            };
             state.position.undo_move(undo);
 
             if !child_result.is_valid() {
@@ -183,6 +195,8 @@ pub fn evaluate_moves(position: &mut Position, opts: &Opts, tt: &mut tt::Transpo
 fn negamax(state: &mut State, depth: u8, mut alpha: Value, beta: Value) -> Value {
     if let Some(outcome) = state.position.get_outcome() {
         return heuristic::calculate_outcome(outcome, state.position.active_player);
+    } else if let Some(v) = state.tablebase.lookup_fast(&mut state.position) {
+        return v;
     } else if depth >= 3 &&
         (state.hard_deadline.map(|dl| Instant::now() > dl).unwrap_or(false) ||
          state.max_nodes.map(|max| state.nodes > max).unwrap_or(false)) {

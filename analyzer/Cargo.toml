@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 base = { workspace = true }
 search = { workspace = true }
+tablebase = { workspace = true }

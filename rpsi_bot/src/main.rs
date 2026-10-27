@@ -3,14 +3,17 @@ use std::io::{self, Write};
 use std::time::Duration;
 
 use base::{Move, Position, Player, tt, history};
+use tablebase::Tablebase;
 
 const HASH_OPTION_PREFIX: &str = "setoption name Hash value ";
 
 fn main() {
-    let tt_max_size_mb: usize = 128_000; // TODO - set this limit based on system memory?
+    let opts = parse_command_line_args();
+    const TT_MAX_SIZE_MB: usize = 128_000; // TODO - set this limit based on system memory?
     let mut position = Position::initial();
     let mut tt = tt::TranspositionTable::new(tt::DEFAULT_TT_SIZE_MB);
     let mut history = history::HistoryTable::new();
+    let tablebase = Tablebase::new(&opts.tablebase_dir);
     for line in io::stdin().lines().map(|line| line.unwrap()) {
         match line.as_str() {
             s if s.starts_with("setoption ") => {
@@ -35,7 +38,7 @@ fn main() {
                 let search_opts = parse_search_opts(position.active_player, &line);
                 tt.next_search();
                 let best_move = search::best_move(
-                    &mut position, &search_opts, &mut tt, &mut history);
+                    &mut position, &search_opts, &mut tt, &mut history, &tablebase);
                 println!("bestmove {}", best_move);
             },
             "rpsi" => {
@@ -48,7 +51,7 @@ fn main() {
 
                 // Transposition table size in MB
                 println!("option name Hash type spin default {} min 1 max {}",
-                    tt::DEFAULT_TT_SIZE_MB, tt_max_size_mb);
+                    tt::DEFAULT_TT_SIZE_MB, TT_MAX_SIZE_MB);
                 println!("protocol 1");
                 println!("rules 2");
                 println!("mode V6 Intransitive");
@@ -190,3 +193,34 @@ fn parse_search_opts(player: Player, line: &str) -> search::Opts {
         hard_deadline,
     }
 }
+
+struct Opts {
+    tablebase_dir: String,
+    tt_size_mb: usize,
+}
+
+fn parse_command_line_args() -> Opts {
+    let mut opts = Opts {
+        tablebase_dir: "data/tablebase".to_string(),
+        tt_size_mb: tt::DEFAULT_TT_SIZE_MB,
+    };
+
+    let mut args = std::env::args();
+    args.next(); // Skip binary name
+    while let Some(token) = args.next() {
+        match token.as_str() {
+            "--hash_mb" | "--hash-mb" | "--tt_size_mb" | "--tt-size-mb" => {
+                opts.tt_size_mb = args.next().unwrap().parse().unwrap();
+            },
+            "--tablebase" | "--tablebase_dir" | "--tablebase-dir" => {
+                opts.tablebase_dir = args.next().unwrap().to_string();
+            },
+            _ => {
+                panic!("unknown command line argument \"{}\"", token);
+            },
+        };
+    }
+
+    opts
+}
+
