@@ -1,10 +1,10 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::cmp;
 use std::fs;
 use std::io::{self, Write};
 
 use rayon::prelude::*;
-use tablebase::{PieceCount, WDL, position_index, normalization, tablebase_name};
+use tablebase::{PieceCount, WDL, position_index, normalization, tablebase_name, Tablebase};
 use base::{Outcome, Player, Position};
 
 struct Opts {
@@ -91,36 +91,54 @@ fn main() {
     let opts = parse_command_line_args();
     init_threads(&opts);
 
-    let mut tablebases = HashMap::new();
-
+    let mut disk_tablebase = Tablebase::new(&opts.output_dir);
     for total_count in 0..=opts.upto_pieces {
-        for piece_count in PieceCount::enumerate_useful_piece_counts(total_count) {
-            let piece_count = normalization::normalize_count(piece_count);
-            if tablebases.contains_key(&piece_count) { continue; }
-            let (tb1, tb2) = gen_tablebase(piece_count, &tablebases, opts.enable_dtm);
-            tablebases.insert(piece_count, tb1);
-            let inverse_piece_count = normalization::normalize_count(piece_count.players_flipped());
-            tablebases.insert(inverse_piece_count, tb2);
-        }
+        rayon::scope(|scope| {
+            let mut already_generated = HashSet::new();
+            for piece_count in PieceCount::enumerate_useful_piece_counts(total_count) {
+                let piece_count = normalization::normalize_count(piece_count);
+                if already_generated.contains(&piece_count) ||
+                    tablebase_already_generated(piece_count, &disk_tablebase, opts.enable_dtm) {
+                        continue;
+                }
+                let (tb1, tb2) = gen_tablebase(piece_count, &disk_tablebase, opts.enable_dtm);
+                let inverse_piece_count =
+                    normalization::normalize_count(piece_count.players_flipped());
+
+                already_generated.insert(piece_count);
+                already_generated.insert(inverse_piece_count);
+
+                let opts = &opts;
+                scope.spawn(move |_| {
+                    output(piece_count, &tb1, opts);
+                });
+                scope.spawn(move |_| {
+                    output(inverse_piece_count, &tb2, opts);
+                });
+            }
+        });
+        disk_tablebase.refresh(&opts.output_dir).unwrap();
     }
 
-    check_all_tablebases(&tablebases, opts.enable_dtm);
-
-    output(&tablebases, &opts);
-
-    println!("{} unique indexes", tablebases.iter().map(|(_, tablebase)| tablebase.wdl.len()).sum::<usize>());
+    check_all_tablebases(&disk_tablebase, opts.enable_dtm);
 }
 
-fn check_all_tablebases(tablebases: &HashMap<PieceCount, MemTb>, enable_dtm: bool) {
+fn tablebase_already_generated(piece_count: PieceCount, disk_tablebase: &Tablebase, enable_dtm: bool) -> bool {
+    disk_tablebase.lookup_wdl_raw(0, piece_count).is_some() &&
+        disk_tablebase.lookup_dtz_raw(0, piece_count).is_some() &&
+        (!enable_dtm || disk_tablebase.lookup_dtm_raw(0, piece_count).is_some())
+}
+
+fn check_all_tablebases(tablebase: &Tablebase, enable_dtm: bool) {
     if cfg!(debug_assertions) {
-        tablebases.par_iter().for_each(|(&piece_count, tablebase)| {
+        tablebase.get_covered_piece_counts().into_par_iter().for_each(|piece_count| {
             assert!(normalization::is_count_normalized(piece_count));
-            (0..tablebase.wdl.len()).into_par_iter().for_each(|before_move_index| {
+            (0..position_index::index_count(piece_count)).into_par_iter().for_each(|before_move_index| {
                 let mut position = Position::from_board_and_player(
-                    position_index::index_to_board(before_move_index as u64, piece_count), Player::Blue);
+                    position_index::index_to_board(before_move_index, piece_count), Player::Blue);
                 assert!(position.get_outcome().is_none());
 
-                let expected_wdl = tablebase.wdl.get(before_move_index);
+                let expected_wdl = tablebase.lookup_wdl_raw(before_move_index, piece_count).unwrap();
                 let mut best_wdl = WDL::Loss;
                 let mut min_dtz = u8::MAX;
                 let mut max_dtz = 0;
@@ -149,22 +167,24 @@ fn check_all_tablebases(tablebases: &HashMap<PieceCount, MemTb>, enable_dtm: boo
                             let undo_normalize = normalization::normalize_position(&mut position, pre_normalize_piece_count);
                             let after_move_piece_count = undo_normalize.piece_count;
                             let after_move_index = position_index::board_to_index(
-                                &position.board, after_move_piece_count) as usize;
-                            let wdl = -tablebases[&after_move_piece_count].wdl.get(after_move_index);
+                                &position.board, after_move_piece_count);
+                            let wdl = -tablebase.lookup_wdl_raw(
+                                after_move_index, after_move_piece_count).unwrap();
                             best_wdl = cmp::max(best_wdl, wdl);
 
                             if wdl == expected_wdl {
                                 let dtz = if m.is_capture {
                                     1
                                 } else {
-                                    tablebases[&after_move_piece_count].dtz[after_move_index] + 1
+                                    tablebase.lookup_dtz_raw(
+                                        after_move_index, after_move_piece_count).unwrap() + 1
                                 };
                                 min_dtz = cmp::min(min_dtz, dtz);
                                 max_dtz = cmp::max(max_dtz, dtz);
 
                                 if enable_dtm {
-                                    let dtm = tablebases[&after_move_piece_count]
-                                        .dtm[after_move_index] + 1;
+                                    let dtm = tablebase.lookup_dtm_raw(
+                                        after_move_index, after_move_piece_count).unwrap() + 1;
                                     min_dtm = cmp::min(min_dtm, dtm);
                                     max_dtm = cmp::max(max_dtm, dtm);
                                 }
@@ -183,14 +203,16 @@ fn check_all_tablebases(tablebases: &HashMap<PieceCount, MemTb>, enable_dtm: boo
                     WDL::Draw => 0,
                     WDL::Loss => max_dtz,
                 };
-                assert_eq!(expected_dtz, tablebase.dtz[before_move_index], "{}", position.board.to_fen());
+                let actual_dtz = tablebase.lookup_dtz_raw(before_move_index, piece_count).unwrap();
+                assert_eq!(expected_dtz, actual_dtz, "{}", position.board.to_fen());
                 if enable_dtm {
                     let expected_dtm = match expected_wdl {
                         WDL::Win => min_dtm,
                         WDL::Draw => 0,
                         WDL::Loss => max_dtm,
                     };
-                    assert_eq!(expected_dtm, tablebase.dtm[before_move_index], "{}", position.board.to_fen());
+                    let actual_dtm = tablebase.lookup_dtm_raw(before_move_index, piece_count).unwrap();
+                    assert_eq!(expected_dtm, actual_dtm, "{}", position.board.to_fen());
                 }
             });
         });
@@ -201,7 +223,7 @@ fn check_all_tablebases(tablebases: &HashMap<PieceCount, MemTb>, enable_dtm: boo
 struct PrecomputedMoves {
     // Position indexes which can reach the corner in one move (or capture for immediate win)
     win_in_one: Vec<usize>,
-    captures: Vec<Vec<(PieceCount, usize)>>,
+    captures: Vec<Vec<(PieceCount, u64)>>,
     // NOTE - non-capturing moves. The index is into the opposite tablebase
     moves: Vec<Vec<usize>>,
     // From the given position, which positions (in the opposite tablebase) can reach this position by moving
@@ -209,7 +231,7 @@ struct PrecomputedMoves {
 }
 fn precompute_moves_single(piece_count: PieceCount, opposite_piece_count: PieceCount) -> PrecomputedMoves {
     let len = position_index::index_count(piece_count) as usize;
-    let mut captures: Vec<Vec<(PieceCount, usize)>> = vec![Vec::new(); len];
+    let mut captures: Vec<Vec<(PieceCount, u64)>> = vec![Vec::new(); len];
     let mut moves: Vec<Vec<usize>> = vec![Vec::new(); len];
 
     let mut win_in_one = (0..len).into_par_iter()
@@ -233,12 +255,12 @@ fn precompute_moves_single(piece_count: PieceCount, opposite_piece_count: PieceC
                     };
                     let undo_normalize = normalization::normalize_position(&mut position, pre_normalize_piece_count);
                     let after_move_index = position_index::board_to_index(
-                        &position.board, undo_normalize.piece_count) as usize;
+                        &position.board, undo_normalize.piece_count);
                     if m.is_capture {
                         captures_inner.push((undo_normalize.piece_count, after_move_index));
                     } else {
                         debug_assert_eq!(opposite_piece_count, undo_normalize.piece_count);
-                        moves_inner.push(after_move_index);
+                        moves_inner.push(after_move_index as usize);
                     }
 
                     normalization::undo_normalize_position(&mut position, undo_normalize);
@@ -290,9 +312,8 @@ fn precompute_moves(forward_piece_count: PieceCount, inverse_piece_count: PieceC
 }
 
 
-fn compute_wdl(forward_tb: &mut MemTb, inverse_tb: &mut MemTb,
-    smaller_tablebases: &HashMap<PieceCount, MemTb>, forward_precomputed_moves: &PrecomputedMoves,
-    inverse_precomputed_moves: &PrecomputedMoves) {
+fn compute_wdl(forward_tb: &mut MemTb, inverse_tb: &mut MemTb, disk_tablebase: &Tablebase,
+    forward_precomputed_moves: &PrecomputedMoves, inverse_precomputed_moves: &PrecomputedMoves) {
 
     let mut queue: VecDeque<(usize, bool)> = VecDeque::new();
 
@@ -312,7 +333,7 @@ fn compute_wdl(forward_tb: &mut MemTb, inverse_tb: &mut MemTb,
 
         for before_move_index in 0..tb.wdl.len() {
             for &(after_capture_piece_count, after_capture_index) in &precomputed_moves.captures[before_move_index] {
-                if smaller_tablebases[&after_capture_piece_count].wdl.get(after_capture_index) == WDL::Loss {
+                if disk_tablebase.lookup_wdl_raw(after_capture_index, after_capture_piece_count).unwrap() == WDL::Loss {
                     tb.wdl.set(before_move_index, WDL::Win);
                     for &after_backward_move_index in &precomputed_moves.backward_moves[before_move_index] {
                         queue.push_back((after_backward_move_index, !is_inverse));
@@ -361,9 +382,8 @@ fn compute_wdl(forward_tb: &mut MemTb, inverse_tb: &mut MemTb,
     }
 }
 
-fn compute_dtz(forward_tb: &mut MemTb, inverse_tb: &mut MemTb,
-    smaller_tablebases: &HashMap<PieceCount, MemTb>, forward_precomputed_moves: &PrecomputedMoves,
-    inverse_precomputed_moves: &PrecomputedMoves) {
+fn compute_dtz(forward_tb: &mut MemTb, inverse_tb: &mut MemTb, disk_tablebase: &Tablebase,
+    forward_precomputed_moves: &PrecomputedMoves, inverse_precomputed_moves: &PrecomputedMoves) {
     let mut queue: VecDeque<(usize, bool)> = VecDeque::new();
 
     for is_inverse in [false, true] {
@@ -382,7 +402,8 @@ fn compute_dtz(forward_tb: &mut MemTb, inverse_tb: &mut MemTb,
 
         for before_move_index in 0..tb.wdl.len() {
             for &(after_capture_piece_count, after_capture_index) in &precomputed_moves.captures[before_move_index] {
-                if smaller_tablebases[&after_capture_piece_count].wdl.get(after_capture_index) == WDL::Loss {
+                if disk_tablebase.lookup_wdl_raw(
+                    after_capture_index, after_capture_piece_count).unwrap() == WDL::Loss {
                     tb.dtz[before_move_index] = 1;
                     for &after_backward_move_index in &precomputed_moves.backward_moves[before_move_index] {
                         queue.push_back((after_backward_move_index, !is_inverse));
@@ -440,9 +461,8 @@ fn compute_dtz(forward_tb: &mut MemTb, inverse_tb: &mut MemTb,
     }
 }
 
-fn compute_dtm(forward_tb: &mut MemTb, inverse_tb: &mut MemTb,
-    smaller_tablebases: &HashMap<PieceCount, MemTb>, forward_precomputed_moves: &PrecomputedMoves,
-    inverse_precomputed_moves: &PrecomputedMoves) {
+fn compute_dtm(forward_tb: &mut MemTb, inverse_tb: &mut MemTb, disk_tablebase: &Tablebase,
+    forward_precomputed_moves: &PrecomputedMoves, inverse_precomputed_moves: &PrecomputedMoves) {
     let mut queue = VecDeque::new();
 
     for is_inverse in [false, true] {
@@ -454,8 +474,10 @@ fn compute_dtm(forward_tb: &mut MemTb, inverse_tb: &mut MemTb,
 
         for before_move_index in 0..tb.wdl.len() {
             for &(after_capture_piece_count, after_capture_index) in &precomputed_moves.captures[before_move_index] {
-                if smaller_tablebases[&after_capture_piece_count].wdl.get(after_capture_index) == WDL::Loss {
-                    tb.dtm[before_move_index] = smaller_tablebases[&after_capture_piece_count].dtm[after_capture_index] + 1;
+                if disk_tablebase.lookup_wdl_raw(
+                    after_capture_index, after_capture_piece_count).unwrap() == WDL::Loss {
+                    tb.dtm[before_move_index] = disk_tablebase.lookup_dtm_raw(
+                        after_capture_index, after_capture_piece_count).unwrap() + 1;
                     for &after_backward_move_index in &precomputed_moves.backward_moves[before_move_index] {
                         queue.push_back((after_backward_move_index, !is_inverse));
                     }
@@ -510,11 +532,12 @@ fn compute_dtm(forward_tb: &mut MemTb, inverse_tb: &mut MemTb,
             }
         }
         for &(after_capture_piece_count, after_capture_index) in &precomputed_moves.captures[before_move_index] {
-            if tb.wdl.get(before_move_index) !=
-                -smaller_tablebases[&after_capture_piece_count].wdl.get(after_capture_index) {
-                    continue;
+            if tb.wdl.get(before_move_index) != -disk_tablebase.lookup_wdl_raw(
+                after_capture_index, after_capture_piece_count).unwrap() {
+                continue;
             }
-            let after_capture_dtm = smaller_tablebases[&after_capture_piece_count].dtm[after_capture_index] + 1;
+            let after_capture_dtm = disk_tablebase.lookup_dtm_raw(
+                after_capture_index, after_capture_piece_count).unwrap() + 1;
             if is_win {
                 best = cmp::min(best, after_capture_dtm);
             } else {
@@ -535,8 +558,7 @@ fn compute_dtm(forward_tb: &mut MemTb, inverse_tb: &mut MemTb,
 }
 
 
-fn gen_tablebase(forward_piece_count: PieceCount, smaller_tablebases: &HashMap<PieceCount, MemTb>,
-    enable_dtm: bool) -> (MemTb, MemTb) {
+fn gen_tablebase(forward_piece_count: PieceCount, disk_tablebase: &Tablebase, enable_dtm: bool) -> (MemTb, MemTb) {
     debug_assert!(normalization::is_count_normalized(forward_piece_count));
     let inverse_piece_count = normalization::normalize_count(forward_piece_count.players_flipped());
 
@@ -550,12 +572,12 @@ fn gen_tablebase(forward_piece_count: PieceCount, smaller_tablebases: &HashMap<P
     let mut forward_tb = MemTb::new(forward_len, enable_dtm);
     let mut inverse_tb = MemTb::new(inverse_len, enable_dtm);
 
-    compute_wdl(&mut forward_tb, &mut inverse_tb, smaller_tablebases,
+    compute_wdl(&mut forward_tb, &mut inverse_tb, disk_tablebase,
         &forward_precomputed_moves, &inverse_precomputed_moves);
-    compute_dtz(&mut forward_tb, &mut inverse_tb, smaller_tablebases,
+    compute_dtz(&mut forward_tb, &mut inverse_tb, disk_tablebase,
         &forward_precomputed_moves, &inverse_precomputed_moves);
     if enable_dtm {
-        compute_dtm(&mut forward_tb, &mut inverse_tb, smaller_tablebases,
+        compute_dtm(&mut forward_tb, &mut inverse_tb, disk_tablebase,
             &forward_precomputed_moves, &inverse_precomputed_moves);
     }
 
@@ -563,18 +585,14 @@ fn gen_tablebase(forward_piece_count: PieceCount, smaller_tablebases: &HashMap<P
 }
 
 
-fn output(tablebases: &HashMap<PieceCount, MemTb>, opts: &Opts) {
+fn output(piece_count: PieceCount, tablebase: &MemTb, opts: &Opts) {
     match opts.output_format {
         OutputFormat::Blackhole => (), // Output nothing
         OutputFormat::Binary => {
-            for (&piece_count, tablebase) in tablebases {
-                output_binary(piece_count, tablebase, opts).unwrap();
-            }
+            output_binary(piece_count, tablebase, opts).unwrap();
         },
         OutputFormat::Text => {
-            for (&piece_count, tablebase) in tablebases {
-                output_text(piece_count, tablebase, opts).unwrap();
-            }
+            output_text(piece_count, tablebase, opts).unwrap();
         },
         OutputFormat::ZlibCompressed => unimplemented!(),
     }
@@ -608,7 +626,6 @@ fn output_text(piece_count: PieceCount, tablebase: &MemTb, opts: &Opts) -> io::R
 
 fn output_binary(piece_count: PieceCount, tablebase: &MemTb, opts: &Opts) -> io::Result<()> {
     fs::create_dir_all(&format!("{}", opts.output_dir))?;
-    let len = (tablebase.wdl.len() as u64).to_le_bytes();
     {
         let mut file = fs::File::create(
             format!("{}/{}.tbw", opts.output_dir, tablebase_name(piece_count)))?;

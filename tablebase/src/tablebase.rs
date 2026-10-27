@@ -151,4 +151,7 @@ impl Tablebase {
             u16::from_le_bytes(dtm_mmap.as_ref()[byte_idx..(byte_idx + 1)].try_into().unwrap())
         })
     }
+    pub fn get_covered_piece_counts(&self) -> Vec<PieceCount> {
+        self.wdl.keys().cloned().collect()
+    }
 }
