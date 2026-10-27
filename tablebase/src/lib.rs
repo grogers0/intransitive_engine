@@ -3,6 +3,7 @@ pub mod normalization;
 pub mod piece_count;
 pub mod position_index;
 pub mod tablebase;
+pub mod validation;
 
 pub use piece_count::PieceCount;
 pub use normalization::{normalize_position, normalize_board, undo_normalize_position, undo_normalize_board, is_normalized};

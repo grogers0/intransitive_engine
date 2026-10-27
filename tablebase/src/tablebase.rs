@@ -48,11 +48,11 @@ impl Tablebase {
             if path.is_dir() { continue; } // Ignore
             if let Some(filename) = path.file_name().and_then(|os_str| os_str.to_str()) {
                 let piece_count = filename_to_piece_count(filename);
-                let tablebase_map = if filename.ends_with(".tbw") {
+                let tablebase_map = if filename.ends_with(".tbwdl") {
                     &mut self.wdl
-                } else if filename.ends_with(".tbz") {
+                } else if filename.ends_with(".tbdtz") {
                     &mut self.dtz
-                } else if filename.ends_with(".tbm") {
+                } else if filename.ends_with(".tbdtm") {
                     &mut self.dtm
                 } else {
                     continue; // Skip unknown files
