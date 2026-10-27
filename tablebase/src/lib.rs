@@ -2,9 +2,11 @@ pub mod combinatorics;
 pub mod normalization;
 pub mod piece_count;
 pub mod position_index;
+pub mod tablebase;
 
 pub use piece_count::PieceCount;
 pub use normalization::{normalize_position, normalize_board, undo_normalize_position, undo_normalize_board, is_normalized};
+pub use tablebase::Tablebase;
 
 use std::{ops, fmt};
 
@@ -32,4 +34,15 @@ impl fmt::Display for WDL {
             WDL::Loss => write!(f, "L"),
         }
     }
+}
+
+pub fn tablebase_name(pc: PieceCount) -> String {
+    let mut s = String::with_capacity(pc.total() as usize);
+    for _ in 0..pc.blue_rock     { s.push('R'); }
+    for _ in 0..pc.blue_paper    { s.push('P'); }
+    for _ in 0..pc.blue_scissors { s.push('S'); }
+    for _ in 0..pc.red_rock      { s.push('r'); }
+    for _ in 0..pc.red_paper     { s.push('p'); }
+    for _ in 0..pc.red_scissors  { s.push('s'); }
+    s
 }

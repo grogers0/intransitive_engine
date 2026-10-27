@@ -4,7 +4,7 @@ use std::fs;
 use std::io::{self, Write};
 
 use rayon::prelude::*;
-use tablebase::{PieceCount, WDL, position_index, normalization};
+use tablebase::{PieceCount, WDL, position_index, normalization, tablebase_name};
 use base::{Outcome, Player, Position};
 
 struct Opts {
@@ -20,19 +20,6 @@ enum OutputFormat {
     Blackhole, Binary, Text, ZlibCompressed,
 }
 
-
-fn tablebase_name(pc: PieceCount) -> String {
-    let cap = pc.blue_rock + pc.blue_paper + pc.blue_scissors +
-        pc.red_rock + pc.red_paper + pc.red_scissors;
-    let mut s = String::with_capacity(cap as usize);
-    for _ in 0..pc.blue_rock     { s.push('R'); }
-    for _ in 0..pc.blue_paper    { s.push('P'); }
-    for _ in 0..pc.blue_scissors { s.push('S'); }
-    for _ in 0..pc.red_rock      { s.push('r'); }
-    for _ in 0..pc.red_paper     { s.push('p'); }
-    for _ in 0..pc.red_scissors  { s.push('s'); }
-    s
-}
 
 // NOTE - all vectors will have the same length
 #[derive(Clone)]
@@ -626,15 +613,13 @@ fn output_binary(piece_count: PieceCount, tablebase: &MemTb, opts: &Opts) -> io:
         let mut file = fs::File::create(
             format!("{}/{}.tbw", opts.output_dir, tablebase_name(piece_count)))?;
         file.write_all(&tablebase.wdl.bytes)?;
-        file.write_all(&len)?;
-        file.write_all(&[4u8, 0u8])?;
+        file.write_all(&[0u8])?;
     }
     {
         let mut file = fs::File::create(
             format!("{}/{}.tbz", opts.output_dir, tablebase_name(piece_count)))?;
         file.write_all(tablebase.dtz.as_slice())?;
-        file.write_all(&len)?;
-        file.write_all(&[8u8, 0u8])?;
+        file.write_all(&[0u8])?;
     }
     if opts.enable_dtm {
         let mut file = fs::File::create(
@@ -643,8 +628,7 @@ fn output_binary(piece_count: PieceCount, tablebase: &MemTb, opts: &Opts) -> io:
         for &v in &tablebase.dtm {
             file.write_all(&v.to_le_bytes())?;
         }
-        file.write_all(&len)?;
-        file.write_all(&[16u8, 0u8])?;
+        file.write_all(&[0u8])?;
     }
     Ok(())
 }
@@ -653,7 +637,7 @@ fn parse_command_line_args() -> Opts {
     let mut opts = Opts {
         upto_pieces: 0,
         enable_dtm: false,
-        output_dir: "data/tablebases".to_string(),
+        output_dir: "data/tablebase".to_string(),
         output_format: OutputFormat::Binary, // TODO - default to ZlibCompressed when implemented
         num_threads: 0, // If 0, num_cpus is used
     };

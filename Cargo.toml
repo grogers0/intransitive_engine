@@ -16,6 +16,7 @@ overflow-checks = true
 
 [workspace.dependencies]
 base = { path = "base" }
-search = { path = "search" }
+memmap2 = "0.9"
 rand = "0.10"
 rayon = "1.12"
+search = { path = "search" }
