@@ -5,7 +5,7 @@ use rayon::prelude::*;
 use crate::{WDL, normalization, position_index, PieceCount, Tablebase};
 use base::{Outcome, Player, Position};
 
-pub fn validate_tablebase(tablebase: &Tablebase, enable_dtm: bool) {
+pub fn validate_tablebase(tablebase: &Tablebase, disable_dtm: bool) {
     tablebase.get_covered_piece_counts().into_par_iter().for_each(|piece_count| {
         assert!(normalization::is_count_normalized(piece_count));
         (0..position_index::index_count(piece_count)).into_par_iter().for_each(|before_move_index| {
@@ -19,6 +19,7 @@ pub fn validate_tablebase(tablebase: &Tablebase, enable_dtm: bool) {
             let mut max_dtz = 0;
             let mut min_dtm = u16::MAX;
             let mut max_dtm = 0;
+            let mut dtm_disabled = disable_dtm;
             for m in position.legal_moves().collect::<Vec<_>>() {
                 let undo_move = position.make_move(m);
                 match position.get_outcome() {
@@ -47,22 +48,26 @@ pub fn validate_tablebase(tablebase: &Tablebase, enable_dtm: bool) {
                             after_move_index, after_move_piece_count).unwrap();
                         best_wdl = cmp::max(best_wdl, wdl);
 
-                        if wdl == expected_wdl {
-                            let dtz = if m.is_capture {
-                                1
-                            } else {
-                                tablebase.lookup_dtz_raw(
-                                    after_move_index, after_move_piece_count).unwrap() + 1
-                            };
+                        let dtz = if m.is_capture {
+                            1
+                        } else {
+                            tablebase.lookup_dtz_raw(
+                                after_move_index, after_move_piece_count).unwrap() + 1
+                        };
+                        max_dtz = cmp::max(max_dtz, dtz);
+                        if wdl == WDL::Win {
                             min_dtz = cmp::min(min_dtz, dtz);
-                            max_dtz = cmp::max(max_dtz, dtz);
+                        }
 
-                            if enable_dtm {
-                                let dtm = tablebase.lookup_dtm_raw(
-                                    after_move_index, after_move_piece_count).unwrap() + 1;
+                        let dtm_opt = tablebase.lookup_dtm_raw(
+                                after_move_index, after_move_piece_count).map(|inner| inner + 1);
+                        if let Some(dtm) = dtm_opt {
+                            max_dtm = cmp::max(max_dtm, dtm);
+                            if wdl == WDL::Win {
                                 min_dtm = cmp::min(min_dtm, dtm);
-                                max_dtm = cmp::max(max_dtm, dtm);
                             }
+                        } else {
+                            dtm_disabled = true;
                         }
 
                         normalization::undo_normalize_position(&mut position, undo_normalize);
@@ -80,7 +85,7 @@ pub fn validate_tablebase(tablebase: &Tablebase, enable_dtm: bool) {
             };
             let actual_dtz = tablebase.lookup_dtz_raw(before_move_index, piece_count).unwrap();
             assert_eq!(expected_dtz, actual_dtz, "{}", position.board.to_fen());
-            if enable_dtm {
+            if !dtm_disabled {
                 let expected_dtm = match expected_wdl {
                     WDL::Win => min_dtm,
                     WDL::Draw => 0,

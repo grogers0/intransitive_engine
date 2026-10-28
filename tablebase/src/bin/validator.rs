@@ -4,18 +4,18 @@ fn main() {
     let opts = parse_command_line_args();
     init_threads(&opts);
     let tablebase = Tablebase::new(&opts.tablebase_dir);
-    validation::validate_tablebase(&tablebase, opts.enable_dtm);
+    validation::validate_tablebase(&tablebase, opts.disable_dtm);
 }
 
 struct Opts {
-    enable_dtm: bool,
+    disable_dtm: bool,
     tablebase_dir: String,
     num_threads: usize,
 }
 
 fn parse_command_line_args() -> Opts {
     let mut opts = Opts {
-        enable_dtm: false,
+        disable_dtm: false,
         tablebase_dir: "data/tablebase".to_string(),
         num_threads: 0, // If 0, num_cpus is used
     };
@@ -24,7 +24,7 @@ fn parse_command_line_args() -> Opts {
     args.next(); // Skip binary name
     while let Some(token) = args.next() {
         match token.as_str() {
-            "--enable_dtm" | "--enable-dtm" | "--dtm" => opts.enable_dtm = true,
+            "--disable_dtm" | "--disable-dtm" | "--no-dtm" | "--no_dtm" => opts.disable_dtm = true,
             "--directory" | "--dir" | "--tablebase_dir" | "--tablebase-dir" => {
                 opts.tablebase_dir = args.next().unwrap().to_string();
             },

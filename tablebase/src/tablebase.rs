@@ -148,7 +148,7 @@ impl Tablebase {
     pub fn lookup_dtm_raw(&self, index: u64, piece_count: PieceCount) -> Option<u16> {
         self.dtm.get(&piece_count).map(|dtm_mmap| {
             let byte_idx = (index as usize) << 1;
-            u16::from_le_bytes(dtm_mmap.as_ref()[byte_idx..(byte_idx + 1)].try_into().unwrap())
+            u16::from_le_bytes(dtm_mmap.as_ref()[byte_idx..(byte_idx + 2)].try_into().unwrap())
         })
     }
     pub fn get_covered_piece_counts(&self) -> Vec<PieceCount> {

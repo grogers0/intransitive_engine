@@ -1,10 +1,11 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicU8, AtomicU16, Ordering};
 use std::cmp;
 use std::fs;
 use std::io::{self, Write};
 
 use rayon::prelude::*;
-use tablebase::{PieceCount, WDL, position_index, normalization, tablebase_name, Tablebase, validation};
+use tablebase::{PieceCount, WDL, position_index, normalization, tablebase_name, Tablebase, validation, AtomicBitset};
 use base::{Outcome, Player, Position};
 
 struct Opts {
@@ -22,33 +23,47 @@ enum OutputFormat {
 
 
 // NOTE - all vectors will have the same length
-#[derive(Clone)]
 struct MemTb {
     wdl: WdlVec,
-    dtz: Vec<u8>,
-    dtm: Vec<u16>,
+    dtz: Box<[AtomicU8]>,
+    dtm: Box<[AtomicU16]>,
 }
 
 impl MemTb {
     fn new(len: usize, enable_dtm: bool) -> MemTb {
-        let dtm = if enable_dtm { vec![0; len] } else { Vec::new() };
-        MemTb {
-            wdl: WdlVec::new(len),
-            dtz: vec![0; len],
-            dtm,
-        }
+        let wdl = WdlVec::new(len);
+        let dtz = (0..len).map(|_| AtomicU8::new(0)).collect::<Vec<_>>().into_boxed_slice();
+        let dtm = if enable_dtm {
+            (0..len).map(|_| AtomicU16::new(0)).collect::<Vec<_>>().into_boxed_slice()
+        } else {
+            Box::new([])
+        };
+        MemTb { wdl, dtz, dtm }
     }
 }
 
-#[derive(Clone)]
+impl Clone for MemTb {
+    fn clone(&self) -> Self {
+        let wdl = self.wdl.clone();
+        let dtz = self.dtz.iter()
+            .map(|atomic_ref| AtomicU8::new(atomic_ref.load(Ordering::Relaxed)))
+            .collect::<Vec<_>>().into_boxed_slice();
+        let dtm = self.dtm.iter()
+            .map(|atomic_ref| AtomicU16::new(atomic_ref.load(Ordering::Relaxed)))
+            .collect::<Vec<_>>().into_boxed_slice();
+        Self { wdl, dtz, dtm }
+    }
+}
+
 struct WdlVec {
     len: usize,
-    bytes: Box<[u8]>,
+    bytes: Box<[AtomicU8]>,
 }
 
 impl WdlVec {
     fn new(len: usize) -> WdlVec {
-        let bytes = vec![0xff; (len + 3) / 4].into_boxed_slice();
+        let bytes = (0..((len + 3) / 4)).map(|_| AtomicU8::new(0xff))
+            .collect::<Vec<_>>().into_boxed_slice();
         WdlVec { len, bytes }
     }
 
@@ -60,7 +75,8 @@ impl WdlVec {
         debug_assert!(idx < self.len);
         let byte_idx = idx >> 2;
         let bit_idx = (idx & 0x03) << 1;
-        match (self.bytes[byte_idx] >> bit_idx) & 0x03 {
+        let byte_val = self.bytes[byte_idx].load(Ordering::Relaxed);
+        match (byte_val >> bit_idx) & 0x03 {
             0 => Some(WDL::Loss),
             1 => Some(WDL::Draw),
             2 => Some(WDL::Win),
@@ -73,17 +89,34 @@ impl WdlVec {
         self.get_option(idx).unwrap()
     }
 
-    fn set(&mut self, idx: usize, wdl: WDL) {
+    fn set(&self, idx: usize, wdl: WDL) {
         debug_assert!(idx < self.len);
         let byte_idx = idx >> 2;
         let bit_idx = (idx & 0x03) << 1;
-        let mut byte = self.bytes[byte_idx];
-        byte &= !(0x03 << bit_idx);
-        byte |= match wdl { WDL::Loss => 0, WDL::Draw => 1, WDL::Win => 2 } << bit_idx;
-        // Shouldn't overwrite unless it's unset (setting to same value is ok)
-        debug_assert!(self.bytes[byte_idx] == byte ||
-            (self.bytes[byte_idx] >> bit_idx) & 0x03 == 0x03);
-        self.bytes[byte_idx] = byte;
+        let mut prev_byte_val = self.bytes[byte_idx].load(Ordering::Relaxed);
+        loop {
+            let mut byte_val = prev_byte_val;
+            byte_val &= !(0x03 << bit_idx);
+            byte_val |= match wdl { WDL::Loss => 0, WDL::Draw => 1, WDL::Win => 2 } << bit_idx;
+            debug_assert!(byte_val == prev_byte_val ||
+                ((prev_byte_val >> bit_idx) & 0x03) == 0x03);
+            // Shouldn't overwrite unless it's unset (setting to same value is ok)
+            let cas_result = self.bytes[byte_idx].compare_exchange_weak(prev_byte_val, byte_val,
+                Ordering::Relaxed, Ordering::Relaxed);
+            match cas_result {
+                Ok(_) => break,
+                Err(updated_byte_val) => prev_byte_val = updated_byte_val,
+            }
+        }
+    }
+}
+
+impl Clone for WdlVec {
+    fn clone(&self) -> Self {
+        let bytes = self.bytes.iter()
+            .map(|byte_ref| AtomicU8::new(byte_ref.load(Ordering::Relaxed)))
+            .collect::<Vec<_>>().into_boxed_slice();
+        Self { len: self.len, bytes }
     }
 }
 
@@ -121,7 +154,7 @@ fn main() {
     }
 
     if cfg!(debug_assertions) {
-        validation::validate_tablebase(&disk_tablebase, opts.enable_dtm);
+        validation::validate_tablebase(&disk_tablebase, !opts.enable_dtm);
     }
 }
 
@@ -223,249 +256,226 @@ fn precompute_moves(forward_piece_count: PieceCount, inverse_piece_count: PieceC
     [forward_precomputed_moves, inverse_precomputed_moves]
 }
 
-
-fn compute_wdl(forward_tb: &mut MemTb, inverse_tb: &mut MemTb, disk_tablebase: &Tablebase,
+fn compute_wdl_and_dtz(forward_tb: &mut MemTb, inverse_tb: &mut MemTb, disk_tablebase: &Tablebase,
     forward_precomputed_moves: &PrecomputedMoves, inverse_precomputed_moves: &PrecomputedMoves) {
 
-    let mut queue: VecDeque<(usize, bool)> = VecDeque::new();
+    let forward_queue = AtomicBitset::new(forward_tb.wdl.len());
+    let inverse_queue = AtomicBitset::new(inverse_tb.wdl.len());
 
-    for is_inverse in [false, true] {
-        let (tb, precomputed_moves) = if is_inverse {
-            (&mut *inverse_tb, inverse_precomputed_moves)
+    [false, true].into_par_iter().with_max_len(1).for_each(|is_inverse| {
+        let (tb, precomputed_moves, opposite_queue) = if is_inverse {
+            (&*inverse_tb, &*inverse_precomputed_moves, &forward_queue)
         } else {
-            (&mut *forward_tb, forward_precomputed_moves)
+            (&*forward_tb, &*forward_precomputed_moves, &inverse_queue)
         };
 
-        for &before_move_index in &precomputed_moves.win_in_one {
-            tb.wdl.set(before_move_index, WDL::Win);
-            for &after_backward_move_index in &precomputed_moves.backward_moves[before_move_index] {
-                queue.push_back((after_backward_move_index, !is_inverse));
-            }
-        }
-
-        for before_move_index in 0..tb.wdl.len() {
-            for &(after_capture_piece_count, after_capture_index) in &precomputed_moves.captures[before_move_index] {
-                if disk_tablebase.lookup_wdl_raw(after_capture_index, after_capture_piece_count).unwrap() == WDL::Loss {
+        rayon::scope(|scope| {
+            scope.spawn(|_| {
+                precomputed_moves.win_in_one.par_iter().with_min_len(65536).for_each(|&before_move_index| {
                     tb.wdl.set(before_move_index, WDL::Win);
+                    tb.dtz[before_move_index].store(1, Ordering::Release);
                     for &after_backward_move_index in &precomputed_moves.backward_moves[before_move_index] {
-                        queue.push_back((after_backward_move_index, !is_inverse));
+                        opposite_queue.insert(after_backward_move_index);
+                    }
+                });
+            });
+
+            (0..tb.wdl.len()).into_par_iter().with_min_len(65536).for_each(|before_move_index| {
+                for &(after_capture_piece_count, after_capture_index) in &precomputed_moves.captures[before_move_index] {
+                    if disk_tablebase.lookup_wdl_raw(after_capture_index, after_capture_piece_count).unwrap() == WDL::Loss {
+                        tb.wdl.set(before_move_index, WDL::Win);
+                        tb.dtz[before_move_index].store(1, Ordering::Release);
+                        for &after_backward_move_index in &precomputed_moves.backward_moves[before_move_index] {
+                            opposite_queue.insert(after_backward_move_index);
+                        }
                     }
                 }
-            }
-        }
-    }
+            });
+        });
+    });
 
-    while let Some((before_move_index, is_inverse)) = queue.pop_front() {
-        let (tb, precomputed_moves, opposite_tb) = if is_inverse {
-            (&mut *inverse_tb, inverse_precomputed_moves, &*forward_tb)
-        } else {
-            (&mut *forward_tb, forward_precomputed_moves, &*inverse_tb)
-        };
-        if tb.wdl.get_option(before_move_index).is_some() {
-            continue;
-        }
-
-        let mut best = Some(WDL::Loss);
-        for &after_move_index in &precomputed_moves.moves[before_move_index] {
-            let wdl = opposite_tb.wdl.get_option(after_move_index).map(|wdl| -wdl);
-            best = match (best, wdl) {
-                (_, Some(WDL::Win)) => Some(WDL::Win),
-                (Some(WDL::Win), None) => Some(WDL::Win),
-                (_, None) => None,
-                (None, _) => None,
-                (Some(a), Some(b)) => Some(cmp::max(a, b)),
+    let mut made_progress = true;
+    let mut ply_threshold = 1;
+    while made_progress {
+        ply_threshold += 1;
+        made_progress = [false, true].into_par_iter().with_max_len(1).map(|is_inverse| {
+            let (tb, precomputed_moves, opposite_tb, queue, opposite_queue) = if is_inverse {
+                (&*inverse_tb, &*inverse_precomputed_moves, &*forward_tb, &inverse_queue, &forward_queue)
+            } else {
+                (&*forward_tb, &*forward_precomputed_moves, &*inverse_tb, &forward_queue, &inverse_queue)
             };
-        }
-        if let Some(wdl) = best {
-            tb.wdl.set(before_move_index, wdl);
-            for &after_backward_move_index in &precomputed_moves.backward_moves[before_move_index] {
-                queue.push_back((after_backward_move_index, !is_inverse));
-            }
-        }
+            queue.par_drain().map(|before_move_index| {
+                if tb.dtz[before_move_index].load(Ordering::Acquire) != 0 {
+                    let wdl = tb.wdl.get_option(before_move_index);
+                    debug_assert!(wdl == Some(WDL::Win) || wdl == Some(WDL::Loss));
+                    return false; // Already calulated
+                }
+
+                let mut best_wdl = Some(WDL::Loss);
+                let mut min_dtz = u8::MAX;
+                let mut max_dtz = 0;
+                for &after_move_index in &precomputed_moves.moves[before_move_index] {
+                    let dtz = opposite_tb.dtz[after_move_index].load(Ordering::Acquire) + 1;
+                    let wdl = opposite_tb.wdl.get_option(after_move_index).map(|wdl| -wdl);
+                    best_wdl = match (best_wdl, wdl) {
+                        (_, Some(WDL::Win)) => Some(WDL::Win),
+                        (Some(WDL::Win), None) => Some(WDL::Win),
+                        (_, None) => None,
+                        (None, _) => None,
+                        (Some(a), Some(b)) => Some(cmp::max(a, b)),
+                    };
+                    max_dtz = cmp::max(max_dtz, dtz);
+                    if wdl == Some(WDL::Win) {
+                        if dtz != 1 {
+                            min_dtz = cmp::min(min_dtz, dtz);
+                        } else {
+                            // NOTE - if dtz == 1 there was a concurrent modification. A racing
+                            // thread stored wdl as a loss (a win for us) after we read the unset
+                            // dtz. Since we iterate ply-by-ply this is irrelevant to the result
+                            // for this node since the dtz being stored would be above the ply
+                            // threshold.
+                            let mut dtz = 1;
+                            while dtz == 1 {
+                                dtz = opposite_tb.dtz[after_move_index].load(Ordering::Relaxed) + 1;
+                            }
+                            assert!(dtz > ply_threshold);
+                        }
+                    }
+                }
+                if let Some(wdl) = best_wdl {
+                    let dtz = if wdl == WDL::Win { min_dtz } else { max_dtz };
+                    if dtz == ply_threshold {
+                        tb.wdl.set(before_move_index, wdl);
+                        tb.dtz[before_move_index].store(dtz, Ordering::Release);
+                        for &after_backward_move_index in &precomputed_moves.backward_moves[before_move_index] {
+                            opposite_queue.insert(after_backward_move_index);
+                        }
+                    } else {
+                        // This can happen because of concurrent processing racing one section of
+                        // the TB ahead. We'll try again next iteration and succeed.
+                        assert!(dtz > ply_threshold);
+                        queue.insert(before_move_index);
+                    }
+                    true
+                } else {
+                    false
+                }
+            }).reduce(|| false, |a, b| a || b)
+        }).reduce(|| false, |a, b| a || b);
     }
 
     // Anything that can't be forced into a win/loss is a draw
-    for tb in [&mut *forward_tb, &mut *inverse_tb] {
-        for index in 0..tb.wdl.len() {
+    [&*forward_tb, &*inverse_tb].par_iter().with_max_len(1).for_each(|tb| {
+        (0..tb.wdl.len()).into_par_iter().with_min_len(65536).for_each(|index| {
             if tb.wdl.get_option(index).is_none() {
                 tb.wdl.set(index, WDL::Draw);
             }
-        }
-    }
+        });
+    });
+
+    [&*forward_tb, &*inverse_tb].par_iter().with_max_len(1).for_each(|tb| {
+        (0..tb.wdl.len()).into_par_iter().with_min_len(65536).for_each(|index| {
+            if tb.dtz[index].load(Ordering::Relaxed) > 200 {
+                // This would be downgraded to a draw, but in practice I don't think it can
+                // actually happen
+                assert!(false, "greater than 200 plies dtz reached");
+            }
+        });
+    });
 }
 
-fn compute_dtz(forward_tb: &mut MemTb, inverse_tb: &mut MemTb, disk_tablebase: &Tablebase,
+// Computing DTM has to re-visit nodes and is slower
+fn compute_dtm(forward_tb: &MemTb, inverse_tb: &MemTb, disk_tablebase: &Tablebase,
     forward_precomputed_moves: &PrecomputedMoves, inverse_precomputed_moves: &PrecomputedMoves) {
-    let mut queue: VecDeque<(usize, bool)> = VecDeque::new();
 
-    for is_inverse in [false, true] {
-        let (tb, precomputed_moves) = if is_inverse {
-            (&mut *inverse_tb, inverse_precomputed_moves)
+    let forward_queue = AtomicBitset::new(forward_tb.wdl.len());
+    let inverse_queue = AtomicBitset::new(inverse_tb.wdl.len());
+
+    [false, true].into_par_iter().with_max_len(1).for_each(|is_inverse| {
+        let (tb, precomputed_moves, opposite_queue, queue) = if is_inverse {
+            (&*inverse_tb, &*inverse_precomputed_moves, &forward_queue, &inverse_queue)
         } else {
-            (&mut *forward_tb, forward_precomputed_moves)
+            (&*forward_tb, &*forward_precomputed_moves, &inverse_queue, &forward_queue)
         };
 
-        for &before_move_index in &precomputed_moves.win_in_one {
-            tb.dtz[before_move_index] = 1;
-            for &after_backward_move_index in &precomputed_moves.backward_moves[before_move_index] {
-                queue.push_back((after_backward_move_index, !is_inverse));
-            }
-        }
-
-        for before_move_index in 0..tb.wdl.len() {
-            for &(after_capture_piece_count, after_capture_index) in &precomputed_moves.captures[before_move_index] {
-                if disk_tablebase.lookup_wdl_raw(
-                    after_capture_index, after_capture_piece_count).unwrap() == WDL::Loss {
-                    tb.dtz[before_move_index] = 1;
+        rayon::scope(|scope| {
+            scope.spawn(|_| {
+                precomputed_moves.win_in_one.par_iter().with_min_len(65536).for_each(|&before_move_index| {
+                    tb.dtm[before_move_index].store(1, Ordering::Relaxed);
                     for &after_backward_move_index in &precomputed_moves.backward_moves[before_move_index] {
-                        queue.push_back((after_backward_move_index, !is_inverse));
+                        opposite_queue.insert(after_backward_move_index);
+                    }
+                });
+            });
+
+            (0..tb.wdl.len()).into_par_iter().with_min_len(65536).for_each(|before_move_index| {
+                for &(after_capture_piece_count, after_capture_index) in &precomputed_moves.captures[before_move_index] {
+                    if disk_tablebase.lookup_wdl_raw(after_capture_index, after_capture_piece_count).unwrap() == WDL::Loss {
+                        let dtm = disk_tablebase.lookup_dtm_raw(after_capture_index, after_capture_piece_count).unwrap() + 1;
+                        debug_assert_ne!(dtm, 1);
+                        // Must sit in the queue until dtm == ply_threshold
+                        queue.insert(before_move_index);
                     }
                 }
-            }
-        }
-    }
+            });
+        });
+    });
 
-    while let Some((before_move_index, is_inverse)) = queue.pop_front() {
-        let (tb, precomputed_moves, opposite_tb) = if is_inverse {
-            (&mut *inverse_tb, inverse_precomputed_moves, &*forward_tb)
-        } else {
-            (&mut *forward_tb, forward_precomputed_moves, &*inverse_tb)
-        };
-
-        if tb.wdl.get(before_move_index) == WDL::Draw {
-            continue;
-        } else if tb.dtz[before_move_index] != 0 {
-            continue; // already set
-        }
-        let is_win = tb.wdl.get(before_move_index) == WDL::Win;
-
-        const MAX_DTZ: u8 = u8::MAX;
-        let mut best = if is_win { MAX_DTZ } else { 1 };
-        for &after_move_index in &precomputed_moves.moves[before_move_index] {
-            if tb.wdl.get(before_move_index) != -opposite_tb.wdl.get(after_move_index) { continue; }
-
-            let after_move_dtz = opposite_tb.dtz[after_move_index];
-            if is_win {
-                // minimize the dtz, unknown values are treated as high since we are breadth-first
-                if after_move_dtz != 0 {
-                    best = cmp::min(best, after_move_dtz + 1);
-                }
+    let mut made_progress = true;
+    let mut ply_threshold = 1;
+    while made_progress {
+        ply_threshold += 1;
+        made_progress = [false, true].into_par_iter().with_max_len(1).map(|is_inverse| {
+            let (tb, precomputed_moves, opposite_tb, queue, opposite_queue) = if is_inverse {
+                (&*inverse_tb, &*inverse_precomputed_moves, &*forward_tb, &inverse_queue, &forward_queue)
             } else {
-                // maximize the dtz, unknown values poison the calculation
-                let after_move_dtz_plus_one = if after_move_dtz == 0 { MAX_DTZ } else { after_move_dtz + 1 };
-                best = cmp::max(best, after_move_dtz_plus_one);
-            }
-        }
-        if best != MAX_DTZ {
-            tb.dtz[before_move_index] = best;
-            for &after_backward_move_index in &precomputed_moves.backward_moves[before_move_index] {
-                queue.push_back((after_backward_move_index, !is_inverse));
-            }
-        }
-    }
+                (&*forward_tb, &*forward_precomputed_moves, &*inverse_tb, &forward_queue, &inverse_queue)
+            };
+            queue.par_drain().map(|before_move_index| {
+                if tb.dtm[before_move_index].load(Ordering::Relaxed) != 0 ||
+                    tb.wdl.get(before_move_index) == WDL::Draw {
+                    return false;
+                }
 
-    // Anything with dtz >= 200 is a draw (TODO need to check if that's >= or >)
-    for &dtz in &forward_tb.dtz {
-        assert!(dtz < 200);
-    }
-    for &dtz in &inverse_tb.dtz {
-        assert!(dtz < 200);
-    }
-}
-
-fn compute_dtm(forward_tb: &mut MemTb, inverse_tb: &mut MemTb, disk_tablebase: &Tablebase,
-    forward_precomputed_moves: &PrecomputedMoves, inverse_precomputed_moves: &PrecomputedMoves) {
-    let mut queue = VecDeque::new();
-
-    for is_inverse in [false, true] {
-        let (tb, precomputed_moves) = if is_inverse {
-            (&mut *inverse_tb, inverse_precomputed_moves)
-        } else {
-            (&mut *forward_tb, forward_precomputed_moves)
-        };
-
-        for before_move_index in 0..tb.wdl.len() {
-            for &(after_capture_piece_count, after_capture_index) in &precomputed_moves.captures[before_move_index] {
-                if disk_tablebase.lookup_wdl_raw(
-                    after_capture_index, after_capture_piece_count).unwrap() == WDL::Loss {
-                    tb.dtm[before_move_index] = disk_tablebase.lookup_dtm_raw(
-                        after_capture_index, after_capture_piece_count).unwrap() + 1;
-                    for &after_backward_move_index in &precomputed_moves.backward_moves[before_move_index] {
-                        queue.push_back((after_backward_move_index, !is_inverse));
+                let mut min_dtm = u16::MAX;
+                let mut max_dtm = 0;
+                for &after_move_index in &precomputed_moves.moves[before_move_index] {
+                    let wdl = -opposite_tb.wdl.get(after_move_index);
+                    let dtm = opposite_tb.dtm[after_move_index].load(Ordering::Relaxed) + 1;
+                    max_dtm = cmp::max(max_dtm, if dtm == 1 { u16::MAX } else { dtm });
+                    if wdl == WDL::Win {
+                        // If the dtm of the child node is unset, treat it as high
+                        if dtm != 1 {
+                            min_dtm = cmp::min(min_dtm, dtm);
+                        }
                     }
                 }
-            }
-        }
-
-        // NOTE - process wins in 1 ply after captures to overwrite if needed
-        for &before_move_index in &precomputed_moves.win_in_one {
-            tb.dtm[before_move_index] = 1;
-            for &after_backward_move_index in &precomputed_moves.backward_moves[before_move_index] {
-                queue.push_back((after_backward_move_index, !is_inverse));
-            }
-        }
-    }
-
-    while let Some((before_move_index, is_inverse)) = queue.pop_front() {
-        let (tb, precomputed_moves, opposite_tb) = if is_inverse {
-            (&mut *inverse_tb, inverse_precomputed_moves, &*forward_tb)
-        } else {
-            (&mut *forward_tb, forward_precomputed_moves, &*inverse_tb)
-        };
-
-        if tb.wdl.get(before_move_index) == WDL::Draw {
-            continue;
-        }
-        let is_win = tb.wdl.get(before_move_index) == WDL::Win;
-
-        const MAX_DTM: u16 = u16::MAX;
-        let mut best = if is_win {
-            if let Ok(_) = precomputed_moves.win_in_one.binary_search(&before_move_index) {
-                1
-            } else {
-                MAX_DTM
-            }
-        } else {
-            0
-        };
-        for &after_move_index in &precomputed_moves.moves[before_move_index] {
-            if tb.wdl.get(before_move_index) != -opposite_tb.wdl.get(after_move_index) { continue; }
-
-            let after_move_dtm = opposite_tb.dtm[after_move_index];
-            if is_win {
-                // minimize the dtm, unknown values are treated as high since we are breadth-first
-                if after_move_dtm != 0 {
-                    best = cmp::min(best, after_move_dtm + 1);
+                for &(after_capture_piece_count, after_capture_index) in &precomputed_moves.captures[before_move_index] {
+                    let wdl = -disk_tablebase.lookup_wdl_raw(after_capture_index, after_capture_piece_count).unwrap();
+                    let dtm = disk_tablebase.lookup_dtm_raw(after_capture_index, after_capture_piece_count).unwrap() + 1;
+                    debug_assert_ne!(dtm, 1); // Because it would be a win_in_one
+                    max_dtm = cmp::max(max_dtm, dtm);
+                    if wdl == WDL::Win {
+                        min_dtm = cmp::min(min_dtm, dtm);
+                    }
                 }
-            } else {
-                // maximize the dtm, unknown values poison the calculation
-                let after_move_dtm_plus_one = if after_move_dtm == 0 { MAX_DTM } else { after_move_dtm + 1 };
-                best = cmp::max(best, after_move_dtm_plus_one);
-            }
-        }
-        for &(after_capture_piece_count, after_capture_index) in &precomputed_moves.captures[before_move_index] {
-            if tb.wdl.get(before_move_index) != -disk_tablebase.lookup_wdl_raw(
-                after_capture_index, after_capture_piece_count).unwrap() {
-                continue;
-            }
-            let after_capture_dtm = disk_tablebase.lookup_dtm_raw(
-                after_capture_index, after_capture_piece_count).unwrap() + 1;
-            if is_win {
-                best = cmp::min(best, after_capture_dtm);
-            } else {
-                best = cmp::max(best, after_capture_dtm);
-            }
-        }
 
-        // NOTE - best can be improved after set the first time since the wavefront might explore
-        // a capture first which leads to a high DTM but then discover a faster path directly to
-        // the goal. TODO - we could probably iteratively increase the limit ply to avoid this
-        if best != MAX_DTM && best != tb.dtm[before_move_index] {
-            tb.dtm[before_move_index] = best;
-            for &after_backward_move_index in &precomputed_moves.backward_moves[before_move_index] {
-                queue.push_back((after_backward_move_index, !is_inverse));
-            }
-        }
+                let dtm = if tb.wdl.get(before_move_index) == WDL::Win { min_dtm } else { max_dtm };
+                if dtm == ply_threshold {
+                    tb.dtm[before_move_index].store(dtm, Ordering::Relaxed);
+                    for &after_backward_move_index in &precomputed_moves.backward_moves[before_move_index] {
+                        opposite_queue.insert(after_backward_move_index);
+                    }
+                } else {
+                    // This can happen because of concurrent processing racing one section of
+                    // the TB ahead, or because we keep requeuing winning captures until the
+                    // threshold is reached. We'll try again next iteration.
+                    assert!(dtm > ply_threshold);
+                    queue.insert(before_move_index);
+                }
+                true
+            }).reduce(|| false, |a, b| a || b)
+        }).reduce(|| false, |a, b| a || b);
     }
 }
 
@@ -484,9 +494,7 @@ fn gen_tablebase(forward_piece_count: PieceCount, disk_tablebase: &Tablebase, en
     let mut forward_tb = MemTb::new(forward_len, enable_dtm);
     let mut inverse_tb = MemTb::new(inverse_len, enable_dtm);
 
-    compute_wdl(&mut forward_tb, &mut inverse_tb, disk_tablebase,
-        &forward_precomputed_moves, &inverse_precomputed_moves);
-    compute_dtz(&mut forward_tb, &mut inverse_tb, disk_tablebase,
+    compute_wdl_and_dtz(&mut forward_tb, &mut inverse_tb, disk_tablebase,
         &forward_precomputed_moves, &inverse_precomputed_moves);
     if enable_dtm {
         compute_dtm(&mut forward_tb, &mut inverse_tb, disk_tablebase,
@@ -523,9 +531,9 @@ fn output_text(piece_count: PieceCount, tablebase: &MemTb, opts: &Opts) -> io::R
         let s = (min_index..max_index).into_par_iter().map(|index| {
             let board = position_index::index_to_board(index as u64, piece_count);
             let wdl = tablebase.wdl.get(index);
-            let dtz = tablebase.dtz[index];
+            let dtz = tablebase.dtz[index].load(Ordering::Relaxed);
             if opts.enable_dtm {
-                let dtm = tablebase.dtm[index];
+                let dtm = tablebase.dtm[index].load(Ordering::Relaxed);
                 format!("{} {wdl} {dtz} {dtm}\n", board.to_fen())
             } else {
                 format!("{} {wdl} {dtz}\n", board.to_fen())
@@ -541,21 +549,29 @@ fn output_binary(piece_count: PieceCount, tablebase: &MemTb, opts: &Opts) -> io:
     {
         let mut file = fs::File::create(
             format!("{}/{}.tbwdl", opts.output_dir, tablebase_name(piece_count)))?;
-        file.write_all(&tablebase.wdl.bytes)?;
+        file.write_all(unsafe {
+            std::slice::from_raw_parts(
+                tablebase.wdl.bytes.as_ptr() as *const u8,
+                tablebase.wdl.bytes.len())
+        })?;
         file.write_all(&[0u8])?;
     }
     {
         let mut file = fs::File::create(
             format!("{}/{}.tbdtz", opts.output_dir, tablebase_name(piece_count)))?;
-        file.write_all(tablebase.dtz.as_slice())?;
+        file.write_all(unsafe {
+            std::slice::from_raw_parts(
+                tablebase.dtz.as_ptr() as *const u8,
+                tablebase.dtz.len())
+        })?;
         file.write_all(&[0u8])?;
     }
     if opts.enable_dtm {
         let mut file = fs::File::create(
             format!("{}/{}.tbdtm", opts.output_dir, tablebase_name(piece_count)))?;
         // TODO - probably faster way to do this
-        for &v in &tablebase.dtm {
-            file.write_all(&v.to_le_bytes())?;
+        for atomic_ref in &tablebase.dtm {
+            file.write_all(&atomic_ref.load(Ordering::Relaxed).to_le_bytes())?;
         }
         file.write_all(&[0u8])?;
     }
