@@ -22,7 +22,7 @@ impl Player {
         }
     }
 
-    const ALL: [Player; 2] = [Player::Blue, Player::Red];
+    pub const ALL: [Player; 2] = [Player::Blue, Player::Red];
     pub fn iter() -> impl Iterator<Item = Player> {
         Self::ALL.iter().cloned()
     }
@@ -50,7 +50,7 @@ impl Piece {
         }
     }
 
-    const ALL: [Piece; 3] = [Piece::Rock, Piece::Paper, Piece::Scissors];
+    pub const ALL: [Piece; 3] = [Piece::Rock, Piece::Paper, Piece::Scissors];
     pub fn iter() -> impl Iterator<Item = Piece> {
         Self::ALL.iter().cloned()
     }

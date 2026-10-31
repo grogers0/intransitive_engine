@@ -6,7 +6,7 @@ use std::io::{self, Write};
 
 use rayon::prelude::*;
 use tablebase::{PieceCount, WDL, position_index, normalization, tablebase_name, Tablebase, validation, AtomicBitset};
-use base::{Outcome, Player, Position};
+use base::{AdjacentLocs, Board, Cell, Outcome, Piece, Player, Position};
 
 struct Opts {
     upto_pieces: u8,
@@ -164,132 +164,189 @@ fn tablebase_already_generated(piece_count: PieceCount, disk_tablebase: &Tableba
         (!enable_dtm || disk_tablebase.lookup_dtm_raw(0, piece_count).is_some())
 }
 
-// Checking all legal moves is pretty slow so precompute it once for each position
-struct PrecomputedMoves {
-    // Position indexes which can reach the corner in one move (or capture for immediate win)
-    win_in_one: Vec<usize>,
-    captures: Vec<Vec<(PieceCount, u64)>>,
-    // NOTE - non-capturing moves. The index is into the opposite tablebase
-    moves: Vec<Vec<usize>>,
-    // From the given position, which positions (in the opposite tablebase) can reach this position by moving
-    backward_moves: Vec<Vec<usize>>,
-}
-fn precompute_moves_single(piece_count: PieceCount, opposite_piece_count: PieceCount) -> PrecomputedMoves {
-    let len = position_index::index_count(piece_count) as usize;
-    let mut captures: Vec<Vec<(PieceCount, u64)>> = vec![Vec::new(); len];
-    let mut moves: Vec<Vec<usize>> = vec![Vec::new(); len];
+// TODO - should this be parallelized? Would need to copy the board state
+fn iter_all_boards<F: FnMut(&mut Board) -> ()>(mut piece_count: PieceCount, board: &mut Board, mut f: F) {
+    fn recurse<F: FnMut(&mut Board) -> ()>(piece_count: &mut PieceCount, board: &mut Board, f: &mut F,
+        cont_player_id: usize, cont_piece_id: usize, cont_x: u8, cont_y: u8) {
+        let mut check = |piece_count: &mut PieceCount, player_id: usize, piece_id: usize, x: u8, y: u8| {
+            let player = Player::ALL[player_id];
+            let piece = Piece::ALL[piece_id];
+            if let Cell::Occupied(_, _) = board.get(x, y) { return; }
+            if (x, y) == Position::corner_goal(player) { return; }
 
-    let mut win_in_one = (0..len).into_par_iter()
-        .zip(captures.par_iter_mut())
-        .zip(moves.par_iter_mut())
-        .filter_map(|((before_move_index, captures_inner), moves_inner)| {
-        let mut can_win_in_one = false;
-        let mut position = Position::from_board_and_player(
-            position_index::index_to_board(before_move_index as u64, piece_count), Player::Blue);
-        for m in position.legal_moves().collect::<Vec<_>>() {
-            let undo_move = position.make_move(m);
-            match position.get_outcome() {
-                Some(Outcome::Win(Player::Blue)) => can_win_in_one = true,
-                Some(Outcome::Win(Player::Red)) => unreachable!(),
-                Some(Outcome::Draw) => unreachable!(),
-                None => {
-                    let pre_normalize_piece_count = if m.is_capture {
-                        PieceCount::from_board(&position.board)
-                    } else {
-                        piece_count
-                    };
-                    let undo_normalize = normalization::normalize_position(&mut position, pre_normalize_piece_count);
-                    let after_move_index = position_index::board_to_index(
-                        &position.board, undo_normalize.piece_count);
-                    if m.is_capture {
-                        captures_inner.push((undo_normalize.piece_count, after_move_index));
-                    } else {
-                        debug_assert_eq!(opposite_piece_count, undo_normalize.piece_count);
-                        moves_inner.push(after_move_index as usize);
-                    }
+            *board.get_mut(x, y) = Cell::Occupied(player, piece);
+            *piece_count.get_mut(player, piece) -= 1;
 
-                    normalization::undo_normalize_position(&mut position, undo_normalize);
-                },
-            };
+            recurse(piece_count, board, f, player_id, piece_id, x + 1, y);
 
-            position.undo_move(undo_move);
-        }
-        if can_win_in_one { Some(before_move_index) } else { None }
-    })
-    .fold(|| Vec::new(), |mut acc, before_move_index| {
-        acc.push(before_move_index);
-        acc
-    })
-    .reduce(|| Vec::new(), |mut a, mut b| {
-        if a.len() > b.len() {
-            a.extend(b);
-            a
+            *piece_count.get_mut(player, piece) += 1;
+            *board.get_mut(x, y) = Cell::Empty;
+        };
+
+        if *piece_count == PieceCount::ZERO {
+            f(board);
         } else {
-            b.extend(a);
-            b
-        }
-    });
-
-    // To allow binary search during DTM calculation
-    win_in_one.sort_unstable();
-
-    PrecomputedMoves { win_in_one, captures, moves, backward_moves: Vec::new() }
-}
-fn compute_backward_moves(precomputed_moves: &mut PrecomputedMoves, opposite_precomputed_moves: &PrecomputedMoves) {
-    precomputed_moves.backward_moves = vec![Vec::new(); precomputed_moves.moves.len()];
-    for before_move_index in 0..opposite_precomputed_moves.moves.len() {
-        for &after_move_index in &opposite_precomputed_moves.moves[before_move_index] {
-            precomputed_moves.backward_moves[after_move_index].push(before_move_index);
+            for player_id in cont_player_id..Player::ALL.len() {
+                let player = Player::ALL[player_id];
+                let is_continuing = player_id == cont_player_id;
+                let min_piece_id = if is_continuing { cont_piece_id } else { 0 };
+                for piece_id in min_piece_id..Piece::ALL.len() {
+                    let piece = Piece::ALL[piece_id];
+                    if piece_count.get(player, piece) != 0 {
+                        let is_continuing = is_continuing && piece_id == cont_piece_id;
+                        let min_y = if is_continuing { cont_y } else { 0 };
+                        for y in min_y..9 {
+                            let is_continuing = is_continuing && y == cont_y;
+                            let min_x = if is_continuing { cont_x } else { 0 };
+                            for x in min_x..9 {
+                                check(piece_count, player_id, piece_id, x, y);
+                            }
+                        }
+                        return;
+                    }
+                }
+            }
         }
     }
+    recurse(&mut piece_count, board, &mut f, 0, 0, 0, 0);
+}
 
-    // TODO - is it necessary? Seems like it may speed up subsequent iterations
-    for after_move_index in 0..precomputed_moves.backward_moves.len() {
-        precomputed_moves.backward_moves[after_move_index].sort();
+fn iter_backward_move_indexes<F: Fn(u64) -> ()>(piece_count: PieceCount, inverse_piece_count: PieceCount,
+    board: &mut Board, f: F) {
+    let players_flipped_piece_count = piece_count.players_flipped();
+    for from_y in 0..9 {
+        for from_x in 0..9 {
+            if let Cell::Occupied(Player::Red, piece) = board.get(from_x, from_y) {
+                for (to_x, to_y) in AdjacentLocs::new(from_x, from_y) {
+                    if let Cell::Occupied(_, _) = board.get(to_x, to_y) {
+                        continue;
+                    } else if (to_x, to_y) == Position::corner_goal(Player::Red) {
+                        continue;
+                    }
+                    *board.get_mut(from_x, from_y) = Cell::Empty;
+                    *board.get_mut(to_x, to_y) = Cell::Occupied(Player::Red, piece);
+                    board.invert_perspective();
+                    let undo_normalize = normalization::normalize_board(board, players_flipped_piece_count);
+                    let after_move_index = position_index::board_to_index(board, inverse_piece_count);
+                    f(after_move_index);
+                    normalization::undo_normalize_board(board, undo_normalize);
+                    board.invert_perspective();
+                    *board.get_mut(to_x, to_y) = Cell::Empty;
+                    *board.get_mut(from_x, from_y) = Cell::Occupied(Player::Red, piece);
+                }
+            }
+        }
     }
 }
-fn precompute_moves(forward_piece_count: PieceCount, inverse_piece_count: PieceCount) -> [PrecomputedMoves; 2] {
-    let mut forward_precomputed_moves = precompute_moves_single(forward_piece_count, inverse_piece_count);
-    let mut inverse_precomputed_moves = precompute_moves_single(inverse_piece_count, forward_piece_count);
-    compute_backward_moves(&mut forward_precomputed_moves, &inverse_precomputed_moves);
-    compute_backward_moves(&mut inverse_precomputed_moves, &forward_precomputed_moves);
-    [forward_precomputed_moves, inverse_precomputed_moves]
-}
 
-fn compute_wdl_and_dtz(forward_tb: &mut MemTb, inverse_tb: &mut MemTb, disk_tablebase: &Tablebase,
-    forward_precomputed_moves: &PrecomputedMoves, inverse_precomputed_moves: &PrecomputedMoves) {
+
+fn compute_wdl_and_dtz(forward_piece_count: PieceCount, inverse_piece_count: PieceCount,
+    forward_tb: &mut MemTb, inverse_tb: &mut MemTb, disk_tablebase: &Tablebase) {
 
     let forward_queue = AtomicBitset::new(forward_tb.wdl.len());
     let inverse_queue = AtomicBitset::new(inverse_tb.wdl.len());
 
     [false, true].into_par_iter().with_max_len(1).for_each(|is_inverse| {
-        let (tb, precomputed_moves, opposite_queue) = if is_inverse {
-            (&*inverse_tb, &*inverse_precomputed_moves, &forward_queue)
+        let (tb, piece_count, opposite_piece_count, opposite_queue) = if is_inverse {
+            (&*inverse_tb, inverse_piece_count, forward_piece_count, &forward_queue)
         } else {
-            (&*forward_tb, &*forward_precomputed_moves, &inverse_queue)
+            (&*forward_tb, forward_piece_count, inverse_piece_count, &inverse_queue)
         };
 
         rayon::scope(|scope| {
             scope.spawn(|_| {
-                precomputed_moves.win_in_one.par_iter().with_min_len(65536).for_each(|&before_move_index| {
-                    tb.wdl.set(before_move_index, WDL::Win);
-                    tb.dtz[before_move_index].store(1, Ordering::Release);
-                    for &after_backward_move_index in &precomputed_moves.backward_moves[before_move_index] {
-                        opposite_queue.insert(after_backward_move_index);
-                    }
+                // Moving to the goal is a win in one
+                let available_blue_pieces = Piece::iter()
+                    .filter(|&piece| piece_count.get(Player::Blue, piece) != 0)
+                    .collect::<Vec<_>>();
+                available_blue_pieces.into_par_iter().with_max_len(1).for_each(|piece| {
+                    [(8, 7), (7, 7), (7, 8)].into_par_iter().with_max_len(1).for_each(|(x, y)| {
+                        let mut outer_board = Board::new();
+                        *outer_board.get_mut(x, y) = Cell::Occupied(Player::Blue, piece);
+                        let remaining_piece_count = piece_count - PieceCount::single(Player::Blue, piece);
+                        iter_all_boards(remaining_piece_count, &mut outer_board, |board| {
+                            let is_win = match board.get(8, 8) {
+                                Cell::Empty => true,
+                                Cell::Occupied(Player::Red, piece2) => piece.can_capture(piece2),
+                                Cell::Occupied(Player::Blue, _) => unreachable!(),
+                            };
+                            if is_win {
+                                let before_move_index = position_index::board_to_index(board, piece_count) as usize;
+                                tb.wdl.set(before_move_index, WDL::Win);
+                                tb.dtz[before_move_index].store(1, Ordering::Relaxed);
+                                iter_backward_move_indexes(piece_count, opposite_piece_count, board,
+                                    |after_backward_move_index| {
+                                        opposite_queue.insert(after_backward_move_index as usize);
+                                    });
+                            }
+                        });
+                    });
                 });
             });
 
-            (0..tb.wdl.len()).into_par_iter().with_min_len(65536).for_each(|before_move_index| {
-                for &(after_capture_piece_count, after_capture_index) in &precomputed_moves.captures[before_move_index] {
-                    if disk_tablebase.lookup_wdl_raw(after_capture_index, after_capture_piece_count).unwrap() == WDL::Loss {
-                        tb.wdl.set(before_move_index, WDL::Win);
-                        tb.dtz[before_move_index].store(1, Ordering::Release);
-                        for &after_backward_move_index in &precomputed_moves.backward_moves[before_move_index] {
-                            opposite_queue.insert(after_backward_move_index);
+            // Captures that win have dtz = 1
+            let available_captured_pieces = Piece::iter()
+                .filter(|&captured_piece|
+                    piece_count.get(Player::Red, captured_piece) != 0 &&
+                    piece_count.get(Player::Blue, captured_piece.captured_by()) != 0)
+                .collect::<Vec<_>>();
+            available_captured_pieces.into_par_iter().with_max_len(1).for_each(|captured_piece| {
+                let capturing_piece = captured_piece.captured_by();
+                let after_capture_piece_count = piece_count - PieceCount::single(Player::Red, captured_piece);
+                let remaining_piece_count = after_capture_piece_count - PieceCount::single(Player::Blue, capturing_piece);
+                let inverted_after_capture_piece_count = after_capture_piece_count.players_flipped();
+                let normalized_inverted_after_capture_piece_count = normalization::normalize_count(inverted_after_capture_piece_count);
+
+                (0..9).into_par_iter().with_max_len(1).for_each(|capturing_y| {
+                    (0..9).into_par_iter().with_max_len(1).for_each(|capturing_x| {
+                        if (capturing_x, capturing_y) == Position::corner_goal(Player::Blue) { return; }
+                        let mut outer_board = Board::new();
+                        *outer_board.get_mut(capturing_x, capturing_y) = Cell::Occupied(Player::Blue, capturing_piece);
+                        for (captured_x, captured_y) in AdjacentLocs::new(capturing_x, capturing_y) {
+                            // Already checked captures into goal above
+                            if (captured_x, captured_y) == Position::corner_goal(Player::Red) { continue; }
+                            *outer_board.get_mut(captured_x, captured_y) = Cell::Occupied(Player::Red, captured_piece);
+                            iter_all_boards(remaining_piece_count, &mut outer_board, |board| {
+                                let before_capture_index = position_index::board_to_index(board, piece_count) as usize;
+                                if after_capture_piece_count.total_for_player(Player::Red) == 0 {
+                                    // Trivial win by capturing all their pieces
+                                    tb.wdl.set(before_capture_index, WDL::Win);
+                                    tb.dtz[before_capture_index].store(1, Ordering::Release);
+                                    iter_backward_move_indexes(piece_count, opposite_piece_count,  board,
+                                        |after_backward_move_index| {
+                                            opposite_queue.insert(after_backward_move_index as usize);
+                                        });
+                                } else {
+                                    *board.get_mut(capturing_x, capturing_y) = Cell::Empty;
+                                    *board.get_mut(captured_x, captured_y) = Cell::Occupied(Player::Blue, capturing_piece);
+                                    board.invert_perspective();
+                                    let undo_normalize = normalization::normalize_board(board, inverted_after_capture_piece_count);
+
+                                    let after_capture_index = position_index::board_to_index(
+                                        &board, normalized_inverted_after_capture_piece_count);
+                                    let wdl = -disk_tablebase.lookup_wdl_raw(
+                                        after_capture_index, normalized_inverted_after_capture_piece_count).unwrap();
+
+                                    normalization::undo_normalize_board(board, undo_normalize);
+                                    board.invert_perspective();
+                                    *board.get_mut(captured_x, captured_y) = Cell::Occupied(Player::Red, captured_piece);
+                                    *board.get_mut(capturing_x, capturing_y) = Cell::Occupied(Player::Blue, capturing_piece);
+
+                                    if wdl == WDL::Win {
+                                        tb.wdl.set(before_capture_index, WDL::Win);
+                                        tb.dtz[before_capture_index].store(1, Ordering::Release);
+                                        iter_backward_move_indexes(piece_count, opposite_piece_count, board,
+                                            |after_backward_move_index| {
+                                                opposite_queue.insert(after_backward_move_index as usize);
+                                            });
+                                    }
+                                }
+                            });
+                            *outer_board.get_mut(captured_x, captured_y) = Cell::Empty;
                         }
-                    }
-                }
+                        *outer_board.get_mut(capturing_x, capturing_y) = Cell::Empty;
+                    });
+                });
             });
         });
     });
@@ -299,57 +356,86 @@ fn compute_wdl_and_dtz(forward_tb: &mut MemTb, inverse_tb: &mut MemTb, disk_tabl
     while made_progress {
         ply_threshold += 1;
         made_progress = [false, true].into_par_iter().with_max_len(1).map(|is_inverse| {
-            let (tb, precomputed_moves, opposite_tb, queue, opposite_queue) = if is_inverse {
-                (&*inverse_tb, &*inverse_precomputed_moves, &*forward_tb, &inverse_queue, &forward_queue)
+            let (tb, opposite_tb, piece_count, opposite_piece_count, queue, opposite_queue) = if is_inverse {
+                (&*inverse_tb, &*forward_tb, inverse_piece_count, forward_piece_count, &inverse_queue, &forward_queue)
             } else {
-                (&*forward_tb, &*forward_precomputed_moves, &*inverse_tb, &forward_queue, &inverse_queue)
+                (&*forward_tb, &*inverse_tb, forward_piece_count, inverse_piece_count, &forward_queue, &inverse_queue)
             };
             queue.par_drain().map(|before_move_index| {
                 if tb.dtz[before_move_index].load(Ordering::Acquire) != 0 {
+                    // Already calculated
                     let wdl = tb.wdl.get_option(before_move_index);
-                    debug_assert!(wdl == Some(WDL::Win) || wdl == Some(WDL::Loss));
-                    return false; // Already calulated
+                    debug_assert_ne!(wdl, None);
+                    debug_assert_ne!(wdl, Some(WDL::Draw));
+                    return false;
                 }
 
+                let board = position_index::index_to_board(before_move_index as u64, piece_count);
+                let mut position = Position::from_board_and_player(board, Player::Blue);
                 let mut best_wdl = Some(WDL::Loss);
                 let mut min_dtz = u8::MAX;
                 let mut max_dtz = 0;
-                for &after_move_index in &precomputed_moves.moves[before_move_index] {
-                    let dtz = opposite_tb.dtz[after_move_index].load(Ordering::Acquire) + 1;
-                    let wdl = opposite_tb.wdl.get_option(after_move_index).map(|wdl| -wdl);
-                    best_wdl = match (best_wdl, wdl) {
-                        (_, Some(WDL::Win)) => Some(WDL::Win),
-                        (Some(WDL::Win), None) => Some(WDL::Win),
-                        (_, None) => None,
-                        (None, _) => None,
-                        (Some(a), Some(b)) => Some(cmp::max(a, b)),
-                    };
-                    max_dtz = cmp::max(max_dtz, dtz);
-                    if wdl == Some(WDL::Win) {
-                        if dtz != 1 {
-                            min_dtz = cmp::min(min_dtz, dtz);
-                        } else {
-                            // NOTE - if dtz == 1 there was a concurrent modification. A racing
-                            // thread stored wdl as a loss (a win for us) after we read the unset
-                            // dtz. Since we iterate ply-by-ply this is irrelevant to the result
-                            // for this node since the dtz being stored would be above the ply
-                            // threshold.
-                            let mut dtz = 1;
-                            while dtz == 1 {
-                                dtz = opposite_tb.dtz[after_move_index].load(Ordering::Relaxed) + 1;
+                // NOTE - useful captures are already handled so exclude them
+                for m in position.legal_moves().filter(|m| !m.is_capture).collect::<Vec<_>>() {
+                    let undo_move = position.make_move(m);
+                    match position.get_outcome() {
+                        Some(Outcome::Win(Player::Blue)) => unreachable!(), // calculated already
+                        Some(Outcome::Win(Player::Red)) => unreachable!(),
+                        Some(Outcome::Draw) => unreachable!(),
+                        None => {
+                            let pre_normalize_piece_count = if m.is_capture {
+                                PieceCount::from_board(&position.board)
+                            } else {
+                                piece_count
+                            };
+                            let undo_normalize = normalization::normalize_position(&mut position, pre_normalize_piece_count);
+                            let after_move_piece_count = undo_normalize.piece_count;
+                            let after_move_index = position_index::board_to_index(
+                                &position.board, after_move_piece_count) as usize;
+
+                            let dtz = opposite_tb.dtz[after_move_index].load(Ordering::Acquire) + 1;
+                            let wdl = opposite_tb.wdl.get_option(after_move_index).map(|wdl| -wdl);
+                            best_wdl = match (best_wdl, wdl) {
+                                (_, Some(WDL::Win)) => Some(WDL::Win),
+                                (Some(WDL::Win), None) => Some(WDL::Win),
+                                (_, None) => None,
+                                (None, _) => None,
+                                (Some(a), Some(b)) => Some(cmp::max(a, b)),
+                            };
+                            max_dtz = cmp::max(max_dtz, dtz);
+                            if wdl == Some(WDL::Win) {
+                                if dtz != 1 {
+                                    min_dtz = cmp::min(min_dtz, dtz);
+                                } else {
+                                    // NOTE - if dtz == 1 there was a concurrent modification. A racing
+                                    // thread stored wdl as a loss (a win for us) after we read the unset
+                                    // dtz. Since we iterate ply-by-ply this is irrelevant to the result
+                                    // for this node since the dtz being stored would be above the ply
+                                    // threshold.
+                                    let mut dtz = 1;
+                                    while dtz == 1 {
+                                        dtz = opposite_tb.dtz[after_move_index].load(Ordering::Relaxed) + 1;
+                                    }
+                                    assert!(dtz > ply_threshold);
+                                }
                             }
-                            assert!(dtz > ply_threshold);
+
+                            normalization::undo_normalize_position(&mut position, undo_normalize);
                         }
                     }
+
+                    position.undo_move(undo_move);
                 }
+
                 if let Some(wdl) = best_wdl {
                     let dtz = if wdl == WDL::Win { min_dtz } else { max_dtz };
                     if dtz == ply_threshold {
                         tb.wdl.set(before_move_index, wdl);
                         tb.dtz[before_move_index].store(dtz, Ordering::Release);
-                        for &after_backward_move_index in &precomputed_moves.backward_moves[before_move_index] {
-                            opposite_queue.insert(after_backward_move_index);
-                        }
+                        iter_backward_move_indexes(piece_count, opposite_piece_count, &mut position.board,
+                            |after_backward_move_index| {
+                                opposite_queue.insert(after_backward_move_index as usize);
+                            });
                     } else {
                         // This can happen because of concurrent processing racing one section of
                         // the TB ahead. We'll try again next iteration and succeed.
@@ -358,65 +444,133 @@ fn compute_wdl_and_dtz(forward_tb: &mut MemTb, inverse_tb: &mut MemTb, disk_tabl
                     }
                     true
                 } else {
+                    // This node will be re-enqueued when child nodes change to possibly allow the
+                    // WDL to be determined
                     false
                 }
             }).reduce(|| false, |a, b| a || b)
         }).reduce(|| false, |a, b| a || b);
     }
 
-    // Anything that can't be forced into a win/loss is a draw
     [&*forward_tb, &*inverse_tb].par_iter().with_max_len(1).for_each(|tb| {
         (0..tb.wdl.len()).into_par_iter().with_min_len(65536).for_each(|index| {
             if tb.wdl.get_option(index).is_none() {
+                // Anything that can't be forced into a win/loss is a draw
                 tb.wdl.set(index, WDL::Draw);
-            }
-        });
-    });
-
-    [&*forward_tb, &*inverse_tb].par_iter().with_max_len(1).for_each(|tb| {
-        (0..tb.wdl.len()).into_par_iter().with_min_len(65536).for_each(|index| {
-            if tb.dtz[index].load(Ordering::Relaxed) > 200 {
-                // This would be downgraded to a draw, but in practice I don't think it can
-                // actually happen
-                assert!(false, "greater than 200 plies dtz reached");
+            } else if tb.dtz[index].load(Ordering::Relaxed) > 200 {
+                // This would be modified to a draw, but in practice I don't think it can actually
+                // happen so let's just assert and revisit that later if neeeded
+                panic!("greater than 200 plies dtz reached");
             }
         });
     });
 }
 
 // Computing DTM has to re-visit nodes and is slower
-fn compute_dtm(forward_tb: &MemTb, inverse_tb: &MemTb, disk_tablebase: &Tablebase,
-    forward_precomputed_moves: &PrecomputedMoves, inverse_precomputed_moves: &PrecomputedMoves) {
+fn compute_dtm(forward_piece_count: PieceCount, inverse_piece_count: PieceCount,
+    forward_tb: &mut MemTb, inverse_tb: &mut MemTb, disk_tablebase: &Tablebase) {
 
     let forward_queue = AtomicBitset::new(forward_tb.wdl.len());
     let inverse_queue = AtomicBitset::new(inverse_tb.wdl.len());
 
     [false, true].into_par_iter().with_max_len(1).for_each(|is_inverse| {
-        let (tb, precomputed_moves, opposite_queue, queue) = if is_inverse {
-            (&*inverse_tb, &*inverse_precomputed_moves, &forward_queue, &inverse_queue)
+        let (tb, piece_count, opposite_piece_count, opposite_queue, queue) = if is_inverse {
+            (&*inverse_tb, inverse_piece_count, forward_piece_count, &forward_queue, &inverse_queue)
         } else {
-            (&*forward_tb, &*forward_precomputed_moves, &inverse_queue, &forward_queue)
+            (&*forward_tb, forward_piece_count, inverse_piece_count, &inverse_queue, &forward_queue)
         };
 
         rayon::scope(|scope| {
             scope.spawn(|_| {
-                precomputed_moves.win_in_one.par_iter().with_min_len(65536).for_each(|&before_move_index| {
-                    tb.dtm[before_move_index].store(1, Ordering::Relaxed);
-                    for &after_backward_move_index in &precomputed_moves.backward_moves[before_move_index] {
-                        opposite_queue.insert(after_backward_move_index);
-                    }
+                // Moving to the goal is a win in one
+                let available_blue_pieces = Piece::iter()
+                    .filter(|&piece| piece_count.get(Player::Blue, piece) != 0)
+                    .collect::<Vec<_>>();
+                available_blue_pieces.into_par_iter().with_max_len(1).for_each(|piece| {
+                    [(8, 7), (7, 7), (7, 8)].into_par_iter().with_max_len(1).for_each(|(x, y)| {
+                        let mut outer_board = Board::new();
+                        *outer_board.get_mut(x, y) = Cell::Occupied(Player::Blue, piece);
+                        let remaining_piece_count = piece_count - PieceCount::single(Player::Blue, piece);
+                        iter_all_boards(remaining_piece_count, &mut outer_board, |board| {
+                            let is_win = match board.get(8, 8) {
+                                Cell::Empty => true,
+                                Cell::Occupied(Player::Red, piece2) => piece.can_capture(piece2),
+                                Cell::Occupied(Player::Blue, _) => unreachable!(),
+                            };
+                            if is_win {
+                                let before_move_index = position_index::board_to_index(board, piece_count) as usize;
+                                tb.dtm[before_move_index].store(1, Ordering::Relaxed);
+                                iter_backward_move_indexes(piece_count, opposite_piece_count, board,
+                                    |after_backward_move_index| {
+                                        opposite_queue.insert(after_backward_move_index as usize);
+                                    });
+                            }
+                        });
+                    });
                 });
             });
 
-            (0..tb.wdl.len()).into_par_iter().with_min_len(65536).for_each(|before_move_index| {
-                for &(after_capture_piece_count, after_capture_index) in &precomputed_moves.captures[before_move_index] {
-                    if disk_tablebase.lookup_wdl_raw(after_capture_index, after_capture_piece_count).unwrap() == WDL::Loss {
-                        let dtm = disk_tablebase.lookup_dtm_raw(after_capture_index, after_capture_piece_count).unwrap() + 1;
-                        debug_assert_ne!(dtm, 1);
-                        // Must sit in the queue until dtm == ply_threshold
-                        queue.insert(before_move_index);
-                    }
-                }
+            // Captures that win
+            let available_captured_pieces = Piece::iter()
+                .filter(|&captured_piece|
+                    piece_count.get(Player::Red, captured_piece) != 0 &&
+                    piece_count.get(Player::Blue, captured_piece.captured_by()) != 0)
+                .collect::<Vec<_>>();
+            available_captured_pieces.into_par_iter().with_max_len(1).for_each(|captured_piece| {
+                let capturing_piece = captured_piece.captured_by();
+                let after_capture_piece_count = piece_count - PieceCount::single(Player::Red, captured_piece);
+                let remaining_piece_count = after_capture_piece_count - PieceCount::single(Player::Blue, capturing_piece);
+                let inverted_after_capture_piece_count = after_capture_piece_count.players_flipped();
+                let normalized_inverted_after_capture_piece_count = normalization::normalize_count(inverted_after_capture_piece_count);
+
+                (0..9).into_par_iter().with_max_len(1).for_each(|capturing_y| {
+                    (0..9).into_par_iter().with_max_len(1).for_each(|capturing_x| {
+                        if (capturing_x, capturing_y) == Position::corner_goal(Player::Blue) { return; }
+                        let mut outer_board = Board::new();
+                        *outer_board.get_mut(capturing_x, capturing_y) = Cell::Occupied(Player::Blue, capturing_piece);
+                        for (captured_x, captured_y) in AdjacentLocs::new(capturing_x, capturing_y) {
+                            // Already checked captures into goal above
+                            if (captured_x, captured_y) == Position::corner_goal(Player::Red) { continue; }
+                            *outer_board.get_mut(captured_x, captured_y) = Cell::Occupied(Player::Red, captured_piece);
+                            iter_all_boards(remaining_piece_count, &mut outer_board, |board| {
+                                let before_capture_index = position_index::board_to_index(board, piece_count) as usize;
+                                if after_capture_piece_count.total_for_player(Player::Red) == 0 {
+                                    // Trivial win by capturing all their pieces
+                                    tb.dtm[before_capture_index].store(1, Ordering::Relaxed);
+                                    iter_backward_move_indexes(piece_count, opposite_piece_count,  board,
+                                        |after_backward_move_index| {
+                                            opposite_queue.insert(after_backward_move_index as usize);
+                                        });
+                                } else {
+                                    *board.get_mut(capturing_x, capturing_y) = Cell::Empty;
+                                    *board.get_mut(captured_x, captured_y) = Cell::Occupied(Player::Blue, capturing_piece);
+                                    board.invert_perspective();
+                                    let undo_normalize = normalization::normalize_board(board, inverted_after_capture_piece_count);
+
+                                    let after_capture_index = position_index::board_to_index(
+                                        &board, normalized_inverted_after_capture_piece_count);
+                                    let wdl = -disk_tablebase.lookup_wdl_raw(
+                                        after_capture_index, normalized_inverted_after_capture_piece_count).unwrap();
+                                    if wdl == WDL::Win {
+                                        let dtm = disk_tablebase.lookup_dtm_raw(
+                                            after_capture_index, normalized_inverted_after_capture_piece_count).unwrap() + 1;
+                                        debug_assert_ne!(dtm, 1);
+                                        // Must sit in the queue until dtm == ply_threshold or a
+                                        // faster path is found
+                                        queue.insert(before_capture_index);
+                                    }
+
+                                    normalization::undo_normalize_board(board, undo_normalize);
+                                    board.invert_perspective();
+                                    *board.get_mut(captured_x, captured_y) = Cell::Occupied(Player::Red, captured_piece);
+                                    *board.get_mut(capturing_x, capturing_y) = Cell::Occupied(Player::Blue, capturing_piece);
+                                }
+                            });
+                            *outer_board.get_mut(captured_x, captured_y) = Cell::Empty;
+                        }
+                        *outer_board.get_mut(capturing_x, capturing_y) = Cell::Empty;
+                    });
+                });
             });
         });
     });
@@ -426,10 +580,10 @@ fn compute_dtm(forward_tb: &MemTb, inverse_tb: &MemTb, disk_tablebase: &Tablebas
     while made_progress {
         ply_threshold += 1;
         made_progress = [false, true].into_par_iter().with_max_len(1).map(|is_inverse| {
-            let (tb, precomputed_moves, opposite_tb, queue, opposite_queue) = if is_inverse {
-                (&*inverse_tb, &*inverse_precomputed_moves, &*forward_tb, &inverse_queue, &forward_queue)
+            let (tb, opposite_tb, piece_count, opposite_piece_count, queue, opposite_queue) = if is_inverse {
+                (&*inverse_tb, &*forward_tb, inverse_piece_count, forward_piece_count, &inverse_queue, &forward_queue)
             } else {
-                (&*forward_tb, &*forward_precomputed_moves, &*inverse_tb, &forward_queue, &inverse_queue)
+                (&*forward_tb, &*inverse_tb, forward_piece_count, inverse_piece_count, &forward_queue, &inverse_queue)
             };
             queue.par_drain().map(|before_move_index| {
                 if tb.dtm[before_move_index].load(Ordering::Relaxed) != 0 ||
@@ -437,45 +591,83 @@ fn compute_dtm(forward_tb: &MemTb, inverse_tb: &MemTb, disk_tablebase: &Tablebas
                     return false;
                 }
 
+                let board = position_index::index_to_board(before_move_index as u64, piece_count);
+                let mut position = Position::from_board_and_player(board, Player::Blue);
                 let mut min_dtm = u16::MAX;
                 let mut max_dtm = 0;
-                for &after_move_index in &precomputed_moves.moves[before_move_index] {
-                    let wdl = -opposite_tb.wdl.get(after_move_index);
-                    let dtm = opposite_tb.dtm[after_move_index].load(Ordering::Relaxed) + 1;
-                    max_dtm = cmp::max(max_dtm, if dtm == 1 { u16::MAX } else { dtm });
-                    if wdl == WDL::Win {
-                        // If the dtm of the child node is unset, treat it as high
-                        if dtm != 1 {
-                            min_dtm = cmp::min(min_dtm, dtm);
+                for m in position.legal_moves().collect::<Vec<_>>() {
+                    let undo_move = position.make_move(m);
+                    match position.get_outcome() {
+                        Some(Outcome::Win(Player::Blue)) => unreachable!(), // calculated already
+                        Some(Outcome::Win(Player::Red)) => unreachable!(),
+                        Some(Outcome::Draw) => unreachable!(),
+                        None => {
+                            let pre_normalize_piece_count = if m.is_capture {
+                                PieceCount::from_board(&position.board)
+                            } else {
+                                piece_count
+                            };
+                            let undo_normalize = normalization::normalize_position(&mut position, pre_normalize_piece_count);
+                            let after_move_piece_count = undo_normalize.piece_count;
+                            let after_move_index = position_index::board_to_index(
+                                &position.board, after_move_piece_count);
+                            if m.is_capture {
+                                let wdl = -disk_tablebase.lookup_wdl_raw(
+                                    after_move_index, after_move_piece_count).unwrap();
+                                let dtm = disk_tablebase.lookup_dtm_raw(
+                                    after_move_index, after_move_piece_count).unwrap() + 1;
+                                debug_assert_ne!(dtm, 1); // Because it would be a win_in_one
+                                max_dtm = cmp::max(max_dtm, dtm);
+                                if wdl == WDL::Win {
+                                    min_dtm = cmp::min(min_dtm, dtm);
+                                }
+                            } else {
+                                let wdl = -opposite_tb.wdl.get(after_move_index as usize);
+                                let dtm = opposite_tb.dtm[after_move_index as usize].load(Ordering::Relaxed) + 1;
+                                // If the dtm of the child node is unset, treat it as high
+                                let dtm = if dtm == 1 { u16::MAX } else { dtm };
+                                max_dtm = cmp::max(max_dtm, dtm);
+                                if wdl == WDL::Win {
+                                    min_dtm = cmp::min(min_dtm, dtm);
+                                }
+                            }
+
+                            normalization::undo_normalize_position(&mut position, undo_normalize);
                         }
                     }
-                }
-                for &(after_capture_piece_count, after_capture_index) in &precomputed_moves.captures[before_move_index] {
-                    let wdl = -disk_tablebase.lookup_wdl_raw(after_capture_index, after_capture_piece_count).unwrap();
-                    let dtm = disk_tablebase.lookup_dtm_raw(after_capture_index, after_capture_piece_count).unwrap() + 1;
-                    debug_assert_ne!(dtm, 1); // Because it would be a win_in_one
-                    max_dtm = cmp::max(max_dtm, dtm);
-                    if wdl == WDL::Win {
-                        min_dtm = cmp::min(min_dtm, dtm);
-                    }
+
+                    position.undo_move(undo_move);
                 }
 
                 let dtm = if tb.wdl.get(before_move_index) == WDL::Win { min_dtm } else { max_dtm };
                 if dtm == ply_threshold {
                     tb.dtm[before_move_index].store(dtm, Ordering::Relaxed);
-                    for &after_backward_move_index in &precomputed_moves.backward_moves[before_move_index] {
-                        opposite_queue.insert(after_backward_move_index);
-                    }
+                    iter_backward_move_indexes(piece_count, opposite_piece_count, &mut position.board,
+                        |after_backward_move_index| {
+                            opposite_queue.insert(after_backward_move_index as usize);
+                        });
                 } else {
                     // This can happen because of concurrent processing racing one section of
                     // the TB ahead, or because we keep requeuing winning captures until the
                     // threshold is reached. We'll try again next iteration.
-                    assert!(dtm > ply_threshold);
+                    debug_assert!(dtm > ply_threshold);
                     queue.insert(before_move_index);
                 }
                 true
             }).reduce(|| false, |a, b| a || b)
         }).reduce(|| false, |a, b| a || b);
+    }
+
+    if cfg!(debug_assertions) {
+        [(&*forward_tb, forward_piece_count), (&*inverse_tb, inverse_piece_count)].into_par_iter().with_max_len(1).for_each(|(tb, pc)| {
+            (0..tb.wdl.len()).into_par_iter().with_min_len(65535).for_each(|index| {
+                if tb.wdl.get(index) == WDL::Draw {
+                    assert_eq!(tb.dtm[index].load(Ordering::Relaxed), 0);
+                } else {
+                    assert_ne!(tb.dtm[index].load(Ordering::Relaxed), 0, "{}", position_index::index_to_board(index as u64, pc).to_fen());
+                }
+            });
+        });
     }
 }
 
@@ -488,17 +680,14 @@ fn gen_tablebase(forward_piece_count: PieceCount, disk_tablebase: &Tablebase, en
     let inverse_len = position_index::index_count(inverse_piece_count) as usize;
     debug_assert_eq!(forward_len, inverse_len);
 
-    let [forward_precomputed_moves, inverse_precomputed_moves] =
-        precompute_moves(forward_piece_count, inverse_piece_count);
-
     let mut forward_tb = MemTb::new(forward_len, enable_dtm);
     let mut inverse_tb = MemTb::new(inverse_len, enable_dtm);
 
-    compute_wdl_and_dtz(&mut forward_tb, &mut inverse_tb, disk_tablebase,
-        &forward_precomputed_moves, &inverse_precomputed_moves);
+    compute_wdl_and_dtz(forward_piece_count, inverse_piece_count,
+        &mut forward_tb, &mut inverse_tb, disk_tablebase);
     if enable_dtm {
-        compute_dtm(&mut forward_tb, &mut inverse_tb, disk_tablebase,
-            &forward_precomputed_moves, &inverse_precomputed_moves);
+        compute_dtm(forward_piece_count, inverse_piece_count,
+            &mut forward_tb, &mut inverse_tb, disk_tablebase);
     }
 
     (forward_tb, inverse_tb)
