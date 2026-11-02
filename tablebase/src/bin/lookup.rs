@@ -1,3 +1,5 @@
+use std::iter;
+
 use base::{Board, Position, Player};
 use tablebase::Tablebase;
 
@@ -66,7 +68,8 @@ fn parse_command_line_args() -> Opts {
                 break;
             },
             _ => {
-                panic!("unknown command line argument \"{}\"", token);
+                opts.position = Some(parse_position(iter::once(token).chain(args)));
+                break;
             },
         };
     }

@@ -67,6 +67,7 @@ impl fmt::Display for Value {
             value_consts::WIN_IN_MAX_PLY..value_consts::WIN  => {
                 write!(f, "win in {} ply", value_consts::WIN - self.0)
             },
+            value_consts::DRAW => write!(f, "draw"),
             value_consts::LOSS => write!(f, "loss"),
             value_consts::LOSS_IN_ONE_PLY..=value_consts::LOSS_IN_MAX_PLY  => {
                 write!(f, "loss in {} ply", self.0 - value_consts::LOSS)

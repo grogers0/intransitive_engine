@@ -239,6 +239,100 @@ fn iter_backward_move_indexes<F: Fn(u64) -> ()>(piece_count: PieceCount, inverse
     }
 }
 
+fn initialize_roots<'a>(piece_count: PieceCount, tb: &'a MemTb, queue: &'a AtomicBitset, scope: &rayon::Scope<'a>) {
+    scope.spawn(move |_| {
+        // TODO - handle moves that win in 1 by blocking all moves in a more efficient way
+        (0..tb.wdl.len()).into_par_iter().with_min_len(65536).for_each(|before_move_index| {
+            let mut position = Position::from_board_and_player(
+                position_index::index_to_board(before_move_index as u64, piece_count), Player::Blue);
+            // Handle board where blue can't make any legal moves
+            match position.get_outcome() {
+                None => (),
+                Some(Outcome::Win(Player::Blue)) | Some(Outcome::Draw) => unreachable!(),
+                Some(Outcome::Win(Player::Red)) => {
+                    tb.wdl.set(before_move_index, WDL::Loss);
+                    // dtz/dtm is already 0 so no need to update it
+                    return;
+                }
+            }
+            // Handle wins in 1 move that aren't explicitly covered below
+            let legal_moves = position.legal_moves()
+                .filter(|m| !m.is_capture)
+                .filter(|m| (m.to_x, m.to_y) != Position::corner_goal(Player::Blue))
+                .collect::<Vec<_>>();
+            for m in legal_moves {
+                let undo_move = position.make_move(m);
+                let outcome = position.get_outcome();
+                position.undo_move(undo_move);
+
+                match outcome {
+                    Some(Outcome::Win(Player::Blue)) => {
+                        queue.insert(before_move_index);
+                        break;
+                    },
+                    Some(Outcome::Win(Player::Red)) => unreachable!(),
+                    Some(Outcome::Draw) => unreachable!(),
+                    None => (),
+                }
+            }
+        });
+    });
+
+    scope.spawn(move |_| {
+        // Moving to the goal is a win in one
+        let available_blue_pieces = Piece::iter()
+            .filter(|&piece| piece_count.get(Player::Blue, piece) != 0)
+            .collect::<Vec<_>>();
+        available_blue_pieces.into_par_iter().with_max_len(1).for_each(|piece| {
+            [(8, 7), (7, 7), (7, 8)].into_par_iter().with_max_len(1).for_each(|(x, y)| {
+                let mut board = Board::new();
+                *board.get_mut(x, y) = Cell::Occupied(Player::Blue, piece);
+                let remaining_piece_count = piece_count - PieceCount::single(Player::Blue, piece);
+                iter_all_boards(remaining_piece_count, &mut board, |board| {
+                    let is_win = match board.get(8, 8) {
+                        Cell::Empty => true,
+                        Cell::Occupied(Player::Red, piece2) => piece.can_capture(piece2),
+                        Cell::Occupied(Player::Blue, _) => unreachable!(),
+                    };
+                    if is_win {
+                        queue.insert(position_index::board_to_index(board, piece_count) as usize);
+                    }
+                });
+            });
+        });
+    });
+
+    // Positions with captures are roots.  NOTE - there are positions with forced losses with a
+    // capture, e.g.  Rs7/ps7/9/9/9/9/9/9/9
+    let available_captured_pieces = Piece::iter()
+        .filter(|&captured_piece|
+            piece_count.get(Player::Red, captured_piece) != 0 &&
+            piece_count.get(Player::Blue, captured_piece.captured_by()) != 0)
+        .collect::<Vec<_>>();
+    available_captured_pieces.into_par_iter().with_max_len(1).for_each(|captured_piece| {
+        let capturing_piece = captured_piece.captured_by();
+        let remaining_piece_count = piece_count - PieceCount::single(Player::Blue, capturing_piece) -
+            PieceCount::single(Player::Red, captured_piece);
+
+        (0..9).into_par_iter().with_max_len(1).for_each(|capturing_y| {
+            (0..9).into_par_iter().with_max_len(1).for_each(|capturing_x| {
+                if (capturing_x, capturing_y) == Position::corner_goal(Player::Blue) { return; }
+                let mut board = Board::new();
+                *board.get_mut(capturing_x, capturing_y) = Cell::Occupied(Player::Blue, capturing_piece);
+                for (captured_x, captured_y) in AdjacentLocs::new(capturing_x, capturing_y) {
+                    // Already checked captures into goal above
+                    if (captured_x, captured_y) == Position::corner_goal(Player::Red) { continue; }
+                    *board.get_mut(captured_x, captured_y) = Cell::Occupied(Player::Red, captured_piece);
+                    iter_all_boards(remaining_piece_count, &mut board, |board| {
+                        queue.insert(position_index::board_to_index(board, piece_count) as usize);
+                    });
+                    *board.get_mut(captured_x, captured_y) = Cell::Empty;
+                }
+                *board.get_mut(capturing_x, capturing_y) = Cell::Empty;
+            });
+        });
+    });
+}
 
 fn compute_wdl_and_dtz(forward_piece_count: PieceCount, inverse_piece_count: PieceCount,
     forward_tb: &mut MemTb, inverse_tb: &mut MemTb, disk_tablebase: &Tablebase) {
@@ -246,113 +340,14 @@ fn compute_wdl_and_dtz(forward_piece_count: PieceCount, inverse_piece_count: Pie
     let forward_queue = AtomicBitset::new(forward_tb.wdl.len());
     let inverse_queue = AtomicBitset::new(inverse_tb.wdl.len());
 
-    [false, true].into_par_iter().with_max_len(1).for_each(|is_inverse| {
-        let (tb, piece_count, opposite_piece_count, opposite_queue) = if is_inverse {
-            (&*inverse_tb, inverse_piece_count, forward_piece_count, &forward_queue)
-        } else {
-            (&*forward_tb, forward_piece_count, inverse_piece_count, &inverse_queue)
-        };
-
-        rayon::scope(|scope| {
-            scope.spawn(|_| {
-                // Moving to the goal is a win in one
-                let available_blue_pieces = Piece::iter()
-                    .filter(|&piece| piece_count.get(Player::Blue, piece) != 0)
-                    .collect::<Vec<_>>();
-                available_blue_pieces.into_par_iter().with_max_len(1).for_each(|piece| {
-                    [(8, 7), (7, 7), (7, 8)].into_par_iter().with_max_len(1).for_each(|(x, y)| {
-                        let mut outer_board = Board::new();
-                        *outer_board.get_mut(x, y) = Cell::Occupied(Player::Blue, piece);
-                        let remaining_piece_count = piece_count - PieceCount::single(Player::Blue, piece);
-                        iter_all_boards(remaining_piece_count, &mut outer_board, |board| {
-                            let is_win = match board.get(8, 8) {
-                                Cell::Empty => true,
-                                Cell::Occupied(Player::Red, piece2) => piece.can_capture(piece2),
-                                Cell::Occupied(Player::Blue, _) => unreachable!(),
-                            };
-                            if is_win {
-                                let before_move_index = position_index::board_to_index(board, piece_count) as usize;
-                                tb.wdl.set(before_move_index, WDL::Win);
-                                tb.dtz[before_move_index].store(1, Ordering::Relaxed);
-                                iter_backward_move_indexes(piece_count, opposite_piece_count, board,
-                                    |after_backward_move_index| {
-                                        opposite_queue.insert(after_backward_move_index as usize);
-                                    });
-                            }
-                        });
-                    });
-                });
-            });
-
-            // Captures that win have dtz = 1
-            let available_captured_pieces = Piece::iter()
-                .filter(|&captured_piece|
-                    piece_count.get(Player::Red, captured_piece) != 0 &&
-                    piece_count.get(Player::Blue, captured_piece.captured_by()) != 0)
-                .collect::<Vec<_>>();
-            available_captured_pieces.into_par_iter().with_max_len(1).for_each(|captured_piece| {
-                let capturing_piece = captured_piece.captured_by();
-                let after_capture_piece_count = piece_count - PieceCount::single(Player::Red, captured_piece);
-                let remaining_piece_count = after_capture_piece_count - PieceCount::single(Player::Blue, capturing_piece);
-                let inverted_after_capture_piece_count = after_capture_piece_count.players_flipped();
-                let normalized_inverted_after_capture_piece_count = normalization::normalize_count(inverted_after_capture_piece_count);
-
-                (0..9).into_par_iter().with_max_len(1).for_each(|capturing_y| {
-                    (0..9).into_par_iter().with_max_len(1).for_each(|capturing_x| {
-                        if (capturing_x, capturing_y) == Position::corner_goal(Player::Blue) { return; }
-                        let mut outer_board = Board::new();
-                        *outer_board.get_mut(capturing_x, capturing_y) = Cell::Occupied(Player::Blue, capturing_piece);
-                        for (captured_x, captured_y) in AdjacentLocs::new(capturing_x, capturing_y) {
-                            // Already checked captures into goal above
-                            if (captured_x, captured_y) == Position::corner_goal(Player::Red) { continue; }
-                            *outer_board.get_mut(captured_x, captured_y) = Cell::Occupied(Player::Red, captured_piece);
-                            iter_all_boards(remaining_piece_count, &mut outer_board, |board| {
-                                let before_capture_index = position_index::board_to_index(board, piece_count) as usize;
-                                if after_capture_piece_count.total_for_player(Player::Red) == 0 {
-                                    // Trivial win by capturing all their pieces
-                                    tb.wdl.set(before_capture_index, WDL::Win);
-                                    tb.dtz[before_capture_index].store(1, Ordering::Release);
-                                    iter_backward_move_indexes(piece_count, opposite_piece_count,  board,
-                                        |after_backward_move_index| {
-                                            opposite_queue.insert(after_backward_move_index as usize);
-                                        });
-                                } else {
-                                    *board.get_mut(capturing_x, capturing_y) = Cell::Empty;
-                                    *board.get_mut(captured_x, captured_y) = Cell::Occupied(Player::Blue, capturing_piece);
-                                    board.invert_perspective();
-                                    let undo_normalize = normalization::normalize_board(board, inverted_after_capture_piece_count);
-
-                                    let after_capture_index = position_index::board_to_index(
-                                        &board, normalized_inverted_after_capture_piece_count);
-                                    let wdl = -disk_tablebase.lookup_wdl_raw(
-                                        after_capture_index, normalized_inverted_after_capture_piece_count).unwrap();
-
-                                    normalization::undo_normalize_board(board, undo_normalize);
-                                    board.invert_perspective();
-                                    *board.get_mut(captured_x, captured_y) = Cell::Occupied(Player::Red, captured_piece);
-                                    *board.get_mut(capturing_x, capturing_y) = Cell::Occupied(Player::Blue, capturing_piece);
-
-                                    if wdl == WDL::Win {
-                                        tb.wdl.set(before_capture_index, WDL::Win);
-                                        tb.dtz[before_capture_index].store(1, Ordering::Release);
-                                        iter_backward_move_indexes(piece_count, opposite_piece_count, board,
-                                            |after_backward_move_index| {
-                                                opposite_queue.insert(after_backward_move_index as usize);
-                                            });
-                                    }
-                                }
-                            });
-                            *outer_board.get_mut(captured_x, captured_y) = Cell::Empty;
-                        }
-                        *outer_board.get_mut(capturing_x, capturing_y) = Cell::Empty;
-                    });
-                });
-            });
-        });
+    rayon::scope(|scope| {
+        scope.spawn(|scope|
+            initialize_roots(forward_piece_count, forward_tb, &forward_queue, scope));
+        initialize_roots(inverse_piece_count, inverse_tb, &inverse_queue, scope);
     });
 
     let mut made_progress = true;
-    let mut ply_threshold = 1;
+    let mut ply_threshold = 0;
     while made_progress {
         ply_threshold += 1;
         made_progress = [false, true].into_par_iter().with_max_len(1).map(|is_inverse| {
@@ -362,11 +357,7 @@ fn compute_wdl_and_dtz(forward_piece_count: PieceCount, inverse_piece_count: Pie
                 (&*forward_tb, &*inverse_tb, forward_piece_count, inverse_piece_count, &forward_queue, &inverse_queue)
             };
             queue.par_drain().map(|before_move_index| {
-                if tb.dtz[before_move_index].load(Ordering::Acquire) != 0 {
-                    // Already calculated
-                    let wdl = tb.wdl.get_option(before_move_index);
-                    debug_assert_ne!(wdl, None);
-                    debug_assert_ne!(wdl, Some(WDL::Draw));
+                if let Some(_) = tb.wdl.get_option(before_move_index) {
                     return false;
                 }
 
@@ -375,11 +366,17 @@ fn compute_wdl_and_dtz(forward_piece_count: PieceCount, inverse_piece_count: Pie
                 let mut best_wdl = Some(WDL::Loss);
                 let mut min_dtz = u8::MAX;
                 let mut max_dtz = 0;
-                // NOTE - useful captures are already handled so exclude them
-                for m in position.legal_moves().filter(|m| !m.is_capture).collect::<Vec<_>>() {
+                for m in position.legal_moves().collect::<Vec<_>>() {
                     let undo_move = position.make_move(m);
-                    match position.get_outcome() {
-                        Some(Outcome::Win(Player::Blue)) => unreachable!(), // calculated already
+                    let outcome = position.get_outcome();
+
+                    match outcome {
+                        Some(Outcome::Win(Player::Blue)) => {
+                            best_wdl = Some(WDL::Win);
+                            min_dtz = 1;
+                            position.undo_move(undo_move);
+                            break;
+                        },
                         Some(Outcome::Win(Player::Red)) => unreachable!(),
                         Some(Outcome::Draw) => unreachable!(),
                         None => {
@@ -393,8 +390,15 @@ fn compute_wdl_and_dtz(forward_piece_count: PieceCount, inverse_piece_count: Pie
                             let after_move_index = position_index::board_to_index(
                                 &position.board, after_move_piece_count) as usize;
 
-                            let dtz = opposite_tb.dtz[after_move_index].load(Ordering::Acquire) + 1;
-                            let wdl = opposite_tb.wdl.get_option(after_move_index).map(|wdl| -wdl);
+                            let dtz;
+                            let wdl;
+                            if m.is_capture {
+                                wdl = disk_tablebase.lookup_wdl_raw(after_move_index as u64, after_move_piece_count).map(|wdl| -wdl);
+                                dtz = 1;
+                            } else {
+                                dtz = opposite_tb.dtz[after_move_index].load(Ordering::Acquire) + 1;
+                                wdl = opposite_tb.wdl.get_option(after_move_index).map(|wdl| -wdl);
+                            }
                             best_wdl = match (best_wdl, wdl) {
                                 (_, Some(WDL::Win)) => Some(WDL::Win),
                                 (Some(WDL::Win), None) => Some(WDL::Win),
@@ -404,7 +408,7 @@ fn compute_wdl_and_dtz(forward_piece_count: PieceCount, inverse_piece_count: Pie
                             };
                             max_dtz = cmp::max(max_dtz, dtz);
                             if wdl == Some(WDL::Win) {
-                                if dtz != 1 {
+                                if dtz != 1 || ply_threshold == 1 {
                                     min_dtz = cmp::min(min_dtz, dtz);
                                 } else {
                                     // NOTE - if dtz == 1 there was a concurrent modification. A racing
@@ -423,30 +427,40 @@ fn compute_wdl_and_dtz(forward_piece_count: PieceCount, inverse_piece_count: Pie
                             normalization::undo_normalize_position(&mut position, undo_normalize);
                         }
                     }
-
                     position.undo_move(undo_move);
                 }
 
-                if let Some(wdl) = best_wdl {
-                    let dtz = if wdl == WDL::Win { min_dtz } else { max_dtz };
-                    if dtz == ply_threshold {
-                        tb.wdl.set(before_move_index, wdl);
-                        tb.dtz[before_move_index].store(dtz, Ordering::Release);
-                        iter_backward_move_indexes(piece_count, opposite_piece_count, &mut position.board,
-                            |after_backward_move_index| {
-                                opposite_queue.insert(after_backward_move_index as usize);
-                            });
-                    } else {
-                        // This can happen because of concurrent processing racing one section of
-                        // the TB ahead. We'll try again next iteration and succeed.
-                        assert!(dtz > ply_threshold);
-                        queue.insert(before_move_index);
-                    }
-                    true
-                } else {
-                    // This node will be re-enqueued when child nodes change to possibly allow the
-                    // WDL to be determined
-                    false
+                match best_wdl {
+                    Some(WDL::Win) | Some(WDL::Loss) => {
+                        let wdl = best_wdl.unwrap();
+                        let dtz = if wdl == WDL::Win { min_dtz } else { max_dtz };
+                        if dtz == ply_threshold {
+                            tb.wdl.set(before_move_index, wdl);
+                            tb.dtz[before_move_index].store(dtz, Ordering::Release);
+                            iter_backward_move_indexes(piece_count, opposite_piece_count, &mut position.board,
+                                |after_backward_move_index| {
+                                    opposite_queue.insert(after_backward_move_index as usize);
+                                });
+                        } else {
+                            // This can happen because of concurrent processing racing one section of
+                            // the TB ahead. We'll try again next iteration and succeed.
+                            debug_assert!(dtz > ply_threshold);
+                            queue.insert(before_move_index);
+                        }
+                        true
+                    },
+                    Some(WDL::Draw) => {
+                        // Most drawn positions can't be forced by backwards propagation, so it
+                        // isn't useful to try any further backwards even if it's known this
+                        // position is a draw
+                        tb.wdl.set(before_move_index, WDL::Draw);
+                        false
+                    },
+                    None => {
+                        // This node will be re-enqueued when child nodes change to possibly allow the
+                        // WDL to be determined
+                        false
+                    },
                 }
             }).reduce(|| false, |a, b| a || b)
         }).reduce(|| false, |a, b| a || b);
@@ -480,98 +494,35 @@ fn compute_dtm(forward_piece_count: PieceCount, inverse_piece_count: PieceCount,
             (&*forward_tb, forward_piece_count, inverse_piece_count, &inverse_queue, &forward_queue)
         };
 
-        rayon::scope(|scope| {
-            scope.spawn(|_| {
-                // Moving to the goal is a win in one
-                let available_blue_pieces = Piece::iter()
-                    .filter(|&piece| piece_count.get(Player::Blue, piece) != 0)
-                    .collect::<Vec<_>>();
-                available_blue_pieces.into_par_iter().with_max_len(1).for_each(|piece| {
-                    [(8, 7), (7, 7), (7, 8)].into_par_iter().with_max_len(1).for_each(|(x, y)| {
-                        let mut outer_board = Board::new();
-                        *outer_board.get_mut(x, y) = Cell::Occupied(Player::Blue, piece);
-                        let remaining_piece_count = piece_count - PieceCount::single(Player::Blue, piece);
-                        iter_all_boards(remaining_piece_count, &mut outer_board, |board| {
-                            let is_win = match board.get(8, 8) {
-                                Cell::Empty => true,
-                                Cell::Occupied(Player::Red, piece2) => piece.can_capture(piece2),
-                                Cell::Occupied(Player::Blue, _) => unreachable!(),
-                            };
-                            if is_win {
-                                let before_move_index = position_index::board_to_index(board, piece_count) as usize;
-                                tb.dtm[before_move_index].store(1, Ordering::Relaxed);
-                                iter_backward_move_indexes(piece_count, opposite_piece_count, board,
-                                    |after_backward_move_index| {
-                                        opposite_queue.insert(after_backward_move_index as usize);
-                                    });
-                            }
-                        });
-                    });
-                });
-            });
+        // All wins in 1 dtz are roots for the dtm search. This is slower than re-enumerating the
+        // roots but saves code complexity
+        (0..tb.wdl.len()).into_par_iter().with_min_len(65536).for_each(|before_move_index| {
+            if tb.dtz[before_move_index].load(Ordering::Relaxed) == 1 && tb.wdl.get(before_move_index) == WDL::Win {
+                let mut position = Position::from_board_and_player(
+                    position_index::index_to_board(before_move_index as u64, piece_count), Player::Blue);
+                for m in position.legal_moves().collect::<Vec<_>>() {
+                    let undo_move = position.make_move(m);
+                    let outcome = position.get_outcome();
+                    position.undo_move(undo_move);
 
-            // Captures that win
-            let available_captured_pieces = Piece::iter()
-                .filter(|&captured_piece|
-                    piece_count.get(Player::Red, captured_piece) != 0 &&
-                    piece_count.get(Player::Blue, captured_piece.captured_by()) != 0)
-                .collect::<Vec<_>>();
-            available_captured_pieces.into_par_iter().with_max_len(1).for_each(|captured_piece| {
-                let capturing_piece = captured_piece.captured_by();
-                let after_capture_piece_count = piece_count - PieceCount::single(Player::Red, captured_piece);
-                let remaining_piece_count = after_capture_piece_count - PieceCount::single(Player::Blue, capturing_piece);
-                let inverted_after_capture_piece_count = after_capture_piece_count.players_flipped();
-                let normalized_inverted_after_capture_piece_count = normalization::normalize_count(inverted_after_capture_piece_count);
-
-                (0..9).into_par_iter().with_max_len(1).for_each(|capturing_y| {
-                    (0..9).into_par_iter().with_max_len(1).for_each(|capturing_x| {
-                        if (capturing_x, capturing_y) == Position::corner_goal(Player::Blue) { return; }
-                        let mut outer_board = Board::new();
-                        *outer_board.get_mut(capturing_x, capturing_y) = Cell::Occupied(Player::Blue, capturing_piece);
-                        for (captured_x, captured_y) in AdjacentLocs::new(capturing_x, capturing_y) {
-                            // Already checked captures into goal above
-                            if (captured_x, captured_y) == Position::corner_goal(Player::Red) { continue; }
-                            *outer_board.get_mut(captured_x, captured_y) = Cell::Occupied(Player::Red, captured_piece);
-                            iter_all_boards(remaining_piece_count, &mut outer_board, |board| {
-                                let before_capture_index = position_index::board_to_index(board, piece_count) as usize;
-                                if after_capture_piece_count.total_for_player(Player::Red) == 0 {
-                                    // Trivial win by capturing all their pieces
-                                    tb.dtm[before_capture_index].store(1, Ordering::Relaxed);
-                                    iter_backward_move_indexes(piece_count, opposite_piece_count,  board,
-                                        |after_backward_move_index| {
-                                            opposite_queue.insert(after_backward_move_index as usize);
-                                        });
-                                } else {
-                                    *board.get_mut(capturing_x, capturing_y) = Cell::Empty;
-                                    *board.get_mut(captured_x, captured_y) = Cell::Occupied(Player::Blue, capturing_piece);
-                                    board.invert_perspective();
-                                    let undo_normalize = normalization::normalize_board(board, inverted_after_capture_piece_count);
-
-                                    let after_capture_index = position_index::board_to_index(
-                                        &board, normalized_inverted_after_capture_piece_count);
-                                    let wdl = -disk_tablebase.lookup_wdl_raw(
-                                        after_capture_index, normalized_inverted_after_capture_piece_count).unwrap();
-                                    if wdl == WDL::Win {
-                                        let dtm = disk_tablebase.lookup_dtm_raw(
-                                            after_capture_index, normalized_inverted_after_capture_piece_count).unwrap() + 1;
-                                        debug_assert_ne!(dtm, 1);
-                                        // Must sit in the queue until dtm == ply_threshold or a
-                                        // faster path is found
-                                        queue.insert(before_capture_index);
-                                    }
-
-                                    normalization::undo_normalize_board(board, undo_normalize);
-                                    board.invert_perspective();
-                                    *board.get_mut(captured_x, captured_y) = Cell::Occupied(Player::Red, captured_piece);
-                                    *board.get_mut(capturing_x, capturing_y) = Cell::Occupied(Player::Blue, capturing_piece);
-                                }
-                            });
-                            *outer_board.get_mut(captured_x, captured_y) = Cell::Empty;
-                        }
-                        *outer_board.get_mut(capturing_x, capturing_y) = Cell::Empty;
-                    });
-                });
-            });
+                    match outcome {
+                        Some(Outcome::Win(Player::Blue)) => {
+                            tb.dtm[before_move_index].store(1, Ordering::Relaxed);
+                            iter_backward_move_indexes(piece_count, opposite_piece_count, &mut position.board,
+                                |after_backward_move_index| {
+                                    opposite_queue.insert(after_backward_move_index as usize);
+                                });
+                            return;
+                        },
+                        Some(Outcome::Win(Player::Red)) => unreachable!(),
+                        Some(Outcome::Draw) => unreachable!(),
+                        None => (),
+                    }
+                }
+                // Must sit in the queue until dtm == ply_threshold or a
+                // faster path is found
+                queue.insert(before_move_index);
+            }
         });
     });
 

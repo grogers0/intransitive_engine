@@ -11,9 +11,6 @@ pub fn validate_tablebase(tablebase: &Tablebase, disable_dtm: bool) {
         (0..position_index::index_count(piece_count)).into_par_iter().for_each(|before_move_index| {
             let mut position = Position::from_board_and_player(
                 position_index::index_to_board(before_move_index, piece_count), Player::Blue);
-            assert!(position.get_outcome().is_none());
-
-            let expected_wdl = tablebase.lookup_wdl_raw(before_move_index, piece_count).unwrap();
             let mut best_wdl = WDL::Loss;
             let mut min_dtz = u8::MAX;
             let mut max_dtz = 0;
@@ -24,7 +21,6 @@ pub fn validate_tablebase(tablebase: &Tablebase, disable_dtm: bool) {
                 let undo_move = position.make_move(m);
                 match position.get_outcome() {
                     Some(Outcome::Win(Player::Blue)) => {
-                        assert_eq!(expected_wdl, WDL::Win);
                         best_wdl = WDL::Win;
                         min_dtz = cmp::min(min_dtz, 1);
                         max_dtz = cmp::max(max_dtz, 1);
@@ -77,22 +73,24 @@ pub fn validate_tablebase(tablebase: &Tablebase, disable_dtm: bool) {
                 position.undo_move(undo_move);
             }
 
-            assert_eq!(best_wdl, expected_wdl, "{}", position.board.to_fen());
-            let expected_dtz = match expected_wdl {
+            let tablebase_wdl = tablebase.lookup_wdl_raw(before_move_index, piece_count).unwrap();
+            let computed_wdl = best_wdl;
+            assert_eq!(computed_wdl, tablebase_wdl, "{}", position.board.to_fen());
+            let computed_dtz = match tablebase_wdl {
                 WDL::Win => min_dtz,
                 WDL::Draw => 0,
                 WDL::Loss => max_dtz,
             };
             let actual_dtz = tablebase.lookup_dtz_raw(before_move_index, piece_count).unwrap();
-            assert_eq!(expected_dtz, actual_dtz, "{}", position.board.to_fen());
+            assert_eq!(computed_dtz, actual_dtz, "{}", position.board.to_fen());
             if !dtm_disabled {
-                let expected_dtm = match expected_wdl {
+                let computed_dtm = match tablebase_wdl {
                     WDL::Win => min_dtm,
                     WDL::Draw => 0,
                     WDL::Loss => max_dtm,
                 };
                 let actual_dtm = tablebase.lookup_dtm_raw(before_move_index, piece_count).unwrap();
-                assert_eq!(expected_dtm, actual_dtm, "{}", position.board.to_fen());
+                assert_eq!(computed_dtm, actual_dtm, "{}", position.board.to_fen());
             }
         });
     });
