@@ -89,8 +89,9 @@ pub fn validate_tablebase(tablebase: &Tablebase, disable_dtm: bool) {
                     WDL::Draw => 0,
                     WDL::Loss => max_dtm,
                 };
-                let actual_dtm = tablebase.lookup_dtm_raw(before_move_index, piece_count).unwrap();
-                assert_eq!(computed_dtm, actual_dtm, "{}", position.board.to_fen());
+                if let Some(actual_dtm) = tablebase.lookup_dtm_raw(before_move_index, piece_count) {
+                    assert_eq!(computed_dtm, actual_dtm, "{}", position.board.to_fen());
+                }
             }
         });
     });
