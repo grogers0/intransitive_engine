@@ -1,167 +1,51 @@
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU8, AtomicU16, Ordering};
+use std::sync::atomic::Ordering;
 use std::cmp;
 use std::fs;
-use std::io::{self, Write};
 
 use rayon::prelude::*;
 use tablebase::{PieceCount, WDL, position_index, normalization, tablebase_name, TablebaseMap, validation, AtomicBitset};
+use tablebase::tablebase::{DtmTablebaseMut, WdlTablebaseMut, DtzTablebaseMut};
 use base::{AdjacentLocs, Board, Cell, Outcome, Piece, Player, Position};
 
 struct Opts {
     upto_pieces: u8,
     enable_dtm: bool,
-    output_dir: String,
-    output_format: OutputFormat,
+    tablebase_dir: String,
+    compressed_output: bool,
     num_threads: usize,
-}
-
-#[derive(Copy, Clone, Eq, PartialEq, Debug)]
-enum OutputFormat {
-    Blackhole, Binary, Text, ZlibCompressed,
-}
-
-
-// NOTE - all vectors will have the same length
-struct MemTb {
-    wdl: WdlVec,
-    dtz: Box<[AtomicU8]>,
-    dtm: Box<[AtomicU16]>,
-}
-
-impl MemTb {
-    fn new(len: usize, enable_dtm: bool) -> MemTb {
-        let wdl = WdlVec::new(len);
-        let dtz = (0..len).map(|_| AtomicU8::new(0)).collect::<Vec<_>>().into_boxed_slice();
-        let dtm = if enable_dtm {
-            (0..len).map(|_| AtomicU16::new(0)).collect::<Vec<_>>().into_boxed_slice()
-        } else {
-            Box::new([])
-        };
-        MemTb { wdl, dtz, dtm }
-    }
-}
-
-impl Clone for MemTb {
-    fn clone(&self) -> Self {
-        let wdl = self.wdl.clone();
-        let dtz = self.dtz.iter()
-            .map(|atomic_ref| AtomicU8::new(atomic_ref.load(Ordering::Relaxed)))
-            .collect::<Vec<_>>().into_boxed_slice();
-        let dtm = self.dtm.iter()
-            .map(|atomic_ref| AtomicU16::new(atomic_ref.load(Ordering::Relaxed)))
-            .collect::<Vec<_>>().into_boxed_slice();
-        Self { wdl, dtz, dtm }
-    }
-}
-
-struct WdlVec {
-    len: usize,
-    bytes: Box<[AtomicU8]>,
-}
-
-impl WdlVec {
-    fn new(len: usize) -> WdlVec {
-        let bytes = (0..((len + 3) / 4)).map(|_| AtomicU8::new(0xff))
-            .collect::<Vec<_>>().into_boxed_slice();
-        WdlVec { len, bytes }
-    }
-
-    fn len(&self) -> usize {
-        self.len
-    }
-
-    fn get_option(&self, idx: usize) -> Option<WDL> {
-        debug_assert!(idx < self.len);
-        let byte_idx = idx >> 2;
-        let bit_idx = (idx & 0x03) << 1;
-        let byte_val = self.bytes[byte_idx].load(Ordering::Relaxed);
-        match (byte_val >> bit_idx) & 0x03 {
-            0 => Some(WDL::Loss),
-            1 => Some(WDL::Draw),
-            2 => Some(WDL::Win),
-            3 => None,
-            _ => unreachable!(),
-        }
-    }
-
-    fn get(&self, idx: usize) -> WDL {
-        self.get_option(idx).unwrap()
-    }
-
-    fn set(&self, idx: usize, wdl: WDL) {
-        debug_assert!(idx < self.len);
-        let byte_idx = idx >> 2;
-        let bit_idx = (idx & 0x03) << 1;
-        let mut prev_byte_val = self.bytes[byte_idx].load(Ordering::Relaxed);
-        loop {
-            let mut byte_val = prev_byte_val;
-            byte_val &= !(0x03 << bit_idx);
-            byte_val |= match wdl { WDL::Loss => 0, WDL::Draw => 1, WDL::Win => 2 } << bit_idx;
-            debug_assert!(byte_val == prev_byte_val ||
-                ((prev_byte_val >> bit_idx) & 0x03) == 0x03);
-            // Shouldn't overwrite unless it's unset (setting to same value is ok)
-            let cas_result = self.bytes[byte_idx].compare_exchange_weak(prev_byte_val, byte_val,
-                Ordering::Relaxed, Ordering::Relaxed);
-            match cas_result {
-                Ok(_) => break,
-                Err(updated_byte_val) => prev_byte_val = updated_byte_val,
-            }
-        }
-    }
-}
-
-impl Clone for WdlVec {
-    fn clone(&self) -> Self {
-        let bytes = self.bytes.iter()
-            .map(|byte_ref| AtomicU8::new(byte_ref.load(Ordering::Relaxed)))
-            .collect::<Vec<_>>().into_boxed_slice();
-        Self { len: self.len, bytes }
-    }
 }
 
 fn main() {
     let opts = parse_command_line_args();
     init_threads(&opts);
 
-    let mut disk_tablebase = TablebaseMap::new(&opts.output_dir);
+    let mut tablebase_map = TablebaseMap::new(&opts.tablebase_dir);
     for total_count in 0..=opts.upto_pieces {
-        rayon::scope(|scope| {
-            let mut already_generated = HashSet::new();
-            for piece_count in PieceCount::enumerate_useful_piece_counts(total_count) {
-                let piece_count = normalization::normalize_count(piece_count);
-                if already_generated.contains(&piece_count) ||
-                    tablebase_already_generated(piece_count, &disk_tablebase, opts.enable_dtm) {
-                        continue;
-                }
-                let (tb1, tb2) = gen_tablebase(piece_count, &disk_tablebase, opts.enable_dtm);
-                let inverse_piece_count =
-                    normalization::normalize_count(piece_count.players_flipped());
-
-                already_generated.insert(piece_count);
-                already_generated.insert(inverse_piece_count);
-
-                let opts = &opts;
-                scope.spawn(move |_| {
-                    output(piece_count, &tb1, opts);
-                });
-                scope.spawn(move |_| {
-                    output(inverse_piece_count, &tb2, opts);
-                });
+        let mut already_generated = HashSet::new();
+        for piece_count in PieceCount::enumerate_useful_piece_counts(total_count) {
+            let piece_count = normalization::normalize_count(piece_count);
+            if already_generated.contains(&piece_count) ||
+                tablebase_already_generated(piece_count, &tablebase_map, opts.enable_dtm) {
+                    continue;
             }
-        });
-        disk_tablebase.refresh(&opts.output_dir).unwrap();
+            gen_tablebase(piece_count, &tablebase_map, &opts);
+            already_generated.insert(piece_count);
+            already_generated.insert(normalization::normalize_count(
+                    piece_count.players_flipped()));
+        }
+        tablebase_map.refresh(&opts.tablebase_dir).unwrap();
     }
 
     if cfg!(debug_assertions) {
-        validation::validate_tablebase(&disk_tablebase, !opts.enable_dtm);
+        validation::validate_tablebase(&tablebase_map, !opts.enable_dtm);
     }
 }
 
-fn tablebase_already_generated(piece_count: PieceCount, disk_tablebase: &TablebaseMap, enable_dtm: bool) -> bool {
-    disk_tablebase.lookup_wdl_raw(0, piece_count).is_some() &&
-        disk_tablebase.lookup_dtz_raw(0, piece_count).is_some() &&
-        (!enable_dtm || disk_tablebase.lookup_dtm_raw(0, piece_count).is_some())
+fn tablebase_already_generated(piece_count: PieceCount, tablebase_map: &TablebaseMap, enable_dtm: bool) -> bool {
+    tablebase_map.lookup_wdl_raw(0, piece_count).is_some() &&
+        tablebase_map.lookup_dtz_raw(0, piece_count).is_some() &&
+        (!enable_dtm || tablebase_map.lookup_dtm_raw(0, piece_count).is_some())
 }
 
 // TODO - should this be parallelized? Would need to copy the board state
@@ -239,10 +123,10 @@ fn iter_backward_move_indexes<F: Fn(u64) -> ()>(piece_count: PieceCount, inverse
     }
 }
 
-fn initialize_roots<'a>(piece_count: PieceCount, tb: &'a MemTb, queue: &'a AtomicBitset, scope: &rayon::Scope<'a>) {
+fn initialize_roots<'a>(piece_count: PieceCount, wdl_tb: &'a WdlTablebaseMut, queue: &'a AtomicBitset, scope: &rayon::Scope<'a>) {
     scope.spawn(move |_| {
         // TODO - handle moves that win in 1 by blocking all moves in a more efficient way
-        (0..tb.wdl.len()).into_par_iter().with_min_len(65536).for_each(|before_move_index| {
+        (0..wdl_tb.len()).into_par_iter().for_each(|before_move_index| {
             let mut position = Position::from_board_and_player(
                 position_index::index_to_board(before_move_index as u64, piece_count), Player::Blue);
             // Handle board where blue can't make any legal moves
@@ -250,7 +134,7 @@ fn initialize_roots<'a>(piece_count: PieceCount, tb: &'a MemTb, queue: &'a Atomi
                 None => (),
                 Some(Outcome::Win(Player::Blue)) | Some(Outcome::Draw) => unreachable!(),
                 Some(Outcome::Win(Player::Red)) => {
-                    tb.wdl.set(before_move_index, WDL::Loss);
+                    wdl_tb.store(before_move_index, WDL::Loss, Ordering::Relaxed);
                     // dtz/dtm is already 0 so no need to update it
                     return;
                 }
@@ -295,7 +179,7 @@ fn initialize_roots<'a>(piece_count: PieceCount, tb: &'a MemTb, queue: &'a Atomi
                         Cell::Occupied(Player::Blue, _) => unreachable!(),
                     };
                     if is_win {
-                        queue.insert(position_index::board_to_index(board, piece_count) as usize);
+                        queue.insert(position_index::board_to_index(board, piece_count));
                     }
                 });
             });
@@ -324,7 +208,7 @@ fn initialize_roots<'a>(piece_count: PieceCount, tb: &'a MemTb, queue: &'a Atomi
                     if (captured_x, captured_y) == Position::corner_goal(Player::Red) { continue; }
                     *board.get_mut(captured_x, captured_y) = Cell::Occupied(Player::Red, captured_piece);
                     iter_all_boards(remaining_piece_count, &mut board, |board| {
-                        queue.insert(position_index::board_to_index(board, piece_count) as usize);
+                        queue.insert(position_index::board_to_index(board, piece_count));
                     });
                     *board.get_mut(captured_x, captured_y) = Cell::Empty;
                 }
@@ -335,15 +219,17 @@ fn initialize_roots<'a>(piece_count: PieceCount, tb: &'a MemTb, queue: &'a Atomi
 }
 
 fn compute_wdl_and_dtz(forward_piece_count: PieceCount, inverse_piece_count: PieceCount,
-    forward_tb: &mut MemTb, inverse_tb: &mut MemTb, disk_tablebase: &TablebaseMap) {
+    forward_wdl_tb: &mut WdlTablebaseMut, forward_dtz_tb: &mut DtzTablebaseMut,
+    inverse_wdl_tb: &mut WdlTablebaseMut, inverse_dtz_tb: &mut DtzTablebaseMut,
+    tablebase_map: &TablebaseMap) {
 
-    let forward_queue = AtomicBitset::new(forward_tb.wdl.len());
-    let inverse_queue = AtomicBitset::new(inverse_tb.wdl.len());
+    let forward_queue = AtomicBitset::new(forward_wdl_tb.len());
+    let inverse_queue = AtomicBitset::new(inverse_wdl_tb.len());
 
     rayon::scope(|scope| {
         scope.spawn(|scope|
-            initialize_roots(forward_piece_count, forward_tb, &forward_queue, scope));
-        initialize_roots(inverse_piece_count, inverse_tb, &inverse_queue, scope);
+            initialize_roots(forward_piece_count, forward_wdl_tb, &forward_queue, scope));
+        initialize_roots(inverse_piece_count, inverse_wdl_tb, &inverse_queue, scope);
     });
 
     let mut made_progress = true;
@@ -351,13 +237,13 @@ fn compute_wdl_and_dtz(forward_piece_count: PieceCount, inverse_piece_count: Pie
     while made_progress {
         ply_threshold += 1;
         made_progress = [false, true].into_par_iter().with_max_len(1).map(|is_inverse| {
-            let (tb, opposite_tb, piece_count, opposite_piece_count, queue, opposite_queue) = if is_inverse {
-                (&*inverse_tb, &*forward_tb, inverse_piece_count, forward_piece_count, &inverse_queue, &forward_queue)
+            let (wdl_tb, dtz_tb, opposite_wdl_tb, opposite_dtz_tb, piece_count, opposite_piece_count, queue, opposite_queue) = if is_inverse {
+                (&*inverse_wdl_tb, &*inverse_dtz_tb, &*forward_wdl_tb, &*forward_dtz_tb, inverse_piece_count, forward_piece_count, &inverse_queue, &forward_queue)
             } else {
-                (&*forward_tb, &*inverse_tb, forward_piece_count, inverse_piece_count, &forward_queue, &inverse_queue)
+                (&*forward_wdl_tb, &*forward_dtz_tb, &*inverse_wdl_tb, &*inverse_dtz_tb, forward_piece_count, inverse_piece_count, &forward_queue, &inverse_queue)
             };
             queue.par_drain().map(|before_move_index| {
-                if let Some(_) = tb.wdl.get_option(before_move_index) {
+                if let Some(_) = wdl_tb.load(before_move_index, Ordering::Relaxed) {
                     return false;
                 }
 
@@ -388,16 +274,16 @@ fn compute_wdl_and_dtz(forward_piece_count: PieceCount, inverse_piece_count: Pie
                             let undo_normalize = normalization::normalize_position(&mut position, pre_normalize_piece_count);
                             let after_move_piece_count = undo_normalize.piece_count;
                             let after_move_index = position_index::board_to_index(
-                                &position.board, after_move_piece_count) as usize;
+                                &position.board, after_move_piece_count);
 
                             let dtz;
                             let wdl;
                             if m.is_capture {
-                                wdl = disk_tablebase.lookup_wdl_raw(after_move_index as u64, after_move_piece_count).map(|wdl| -wdl);
+                                wdl = tablebase_map.lookup_wdl_raw(after_move_index, after_move_piece_count).map(|wdl| -wdl);
                                 dtz = 1;
                             } else {
-                                dtz = opposite_tb.dtz[after_move_index].load(Ordering::Acquire) + 1;
-                                wdl = opposite_tb.wdl.get_option(after_move_index).map(|wdl| -wdl);
+                                dtz = opposite_dtz_tb.load(after_move_index, Ordering::Acquire) + 1;
+                                wdl = opposite_wdl_tb.load(after_move_index, Ordering::Relaxed).map(|wdl| -wdl);
                             }
                             best_wdl = match (best_wdl, wdl) {
                                 (_, Some(WDL::Win)) => Some(WDL::Win),
@@ -418,7 +304,7 @@ fn compute_wdl_and_dtz(forward_piece_count: PieceCount, inverse_piece_count: Pie
                                     // threshold.
                                     let mut dtz = 1;
                                     while dtz == 1 {
-                                        dtz = opposite_tb.dtz[after_move_index].load(Ordering::Relaxed) + 1;
+                                        dtz = opposite_dtz_tb.load(after_move_index, Ordering::Relaxed) + 1;
                                     }
                                     assert!(dtz > ply_threshold);
                                 }
@@ -435,11 +321,11 @@ fn compute_wdl_and_dtz(forward_piece_count: PieceCount, inverse_piece_count: Pie
                         let wdl = best_wdl.unwrap();
                         let dtz = if wdl == WDL::Win { min_dtz } else { max_dtz };
                         if dtz == ply_threshold {
-                            tb.wdl.set(before_move_index, wdl);
-                            tb.dtz[before_move_index].store(dtz, Ordering::Release);
+                            wdl_tb.store(before_move_index, wdl, Ordering::Relaxed);
+                            dtz_tb.store(before_move_index, dtz, Ordering::Release);
                             iter_backward_move_indexes(piece_count, opposite_piece_count, &mut position.board,
                                 |after_backward_move_index| {
-                                    opposite_queue.insert(after_backward_move_index as usize);
+                                    opposite_queue.insert(after_backward_move_index);
                                 });
                         } else {
                             // This can happen because of concurrent processing racing one section of
@@ -453,7 +339,7 @@ fn compute_wdl_and_dtz(forward_piece_count: PieceCount, inverse_piece_count: Pie
                         // Most drawn positions can't be forced by backwards propagation, so it
                         // isn't useful to try any further backwards even if it's known this
                         // position is a draw
-                        tb.wdl.set(before_move_index, WDL::Draw);
+                        wdl_tb.store(before_move_index, WDL::Draw, Ordering::Relaxed);
                         false
                     },
                     None => {
@@ -466,12 +352,12 @@ fn compute_wdl_and_dtz(forward_piece_count: PieceCount, inverse_piece_count: Pie
         }).reduce(|| false, |a, b| a || b);
     }
 
-    [&*forward_tb, &*inverse_tb].par_iter().with_max_len(1).for_each(|tb| {
-        (0..tb.wdl.len()).into_par_iter().with_min_len(65536).for_each(|index| {
-            if tb.wdl.get_option(index).is_none() {
+    [(&*forward_wdl_tb, &*forward_dtz_tb), (&*inverse_wdl_tb, &*inverse_dtz_tb)].par_iter().with_max_len(1).for_each(|(wdl_tb, dtz_tb)| {
+        (0..wdl_tb.len()).into_par_iter().for_each(|index| {
+            if wdl_tb.load(index, Ordering::Relaxed).is_none() {
                 // Anything that can't be forced into a win/loss is a draw
-                tb.wdl.set(index, WDL::Draw);
-            } else if tb.dtz[index].load(Ordering::Relaxed) > 200 {
+                wdl_tb.store(index, WDL::Draw, Ordering::Relaxed);
+            } else if dtz_tb.load(index, Ordering::Relaxed) > 200 {
                 // This would be modified to a draw, but in practice I don't think it can actually
                 // happen so let's just assert and revisit that later if neeeded
                 panic!("greater than 200 plies dtz reached");
@@ -482,22 +368,24 @@ fn compute_wdl_and_dtz(forward_piece_count: PieceCount, inverse_piece_count: Pie
 
 // Computing DTM has to re-visit nodes and is slower
 fn compute_dtm(forward_piece_count: PieceCount, inverse_piece_count: PieceCount,
-    forward_tb: &mut MemTb, inverse_tb: &mut MemTb, disk_tablebase: &TablebaseMap) {
+    forward_wdl_tb: &WdlTablebaseMut, forward_dtz_tb: &DtzTablebaseMut, forward_dtm_tb: &mut DtmTablebaseMut,
+    inverse_wdl_tb: &WdlTablebaseMut, inverse_dtz_tb: &DtzTablebaseMut, inverse_dtm_tb: &mut DtmTablebaseMut,
+    tablebase_map: &TablebaseMap) {
 
-    let forward_queue = AtomicBitset::new(forward_tb.wdl.len());
-    let inverse_queue = AtomicBitset::new(inverse_tb.wdl.len());
+    let forward_queue = AtomicBitset::new(forward_wdl_tb.len());
+    let inverse_queue = AtomicBitset::new(inverse_wdl_tb.len());
 
     [false, true].into_par_iter().with_max_len(1).for_each(|is_inverse| {
-        let (tb, piece_count, opposite_piece_count, opposite_queue, queue) = if is_inverse {
-            (&*inverse_tb, inverse_piece_count, forward_piece_count, &forward_queue, &inverse_queue)
+        let (wdl_tb, dtz_tb, dtm_tb, piece_count, opposite_piece_count, opposite_queue, queue) = if is_inverse {
+            (&*inverse_wdl_tb, &*inverse_dtz_tb, &*inverse_dtm_tb, inverse_piece_count, forward_piece_count, &forward_queue, &inverse_queue)
         } else {
-            (&*forward_tb, forward_piece_count, inverse_piece_count, &inverse_queue, &forward_queue)
+            (&*forward_wdl_tb, &*forward_dtz_tb, &*forward_dtm_tb, forward_piece_count, inverse_piece_count, &inverse_queue, &forward_queue)
         };
 
         // All wins in 1 dtz are roots for the dtm search. This is slower than re-enumerating the
         // roots but saves code complexity
-        (0..tb.wdl.len()).into_par_iter().with_min_len(65536).for_each(|before_move_index| {
-            if tb.dtz[before_move_index].load(Ordering::Relaxed) == 1 && tb.wdl.get(before_move_index) == WDL::Win {
+        (0..wdl_tb.len()).into_par_iter().for_each(|before_move_index| {
+            if dtz_tb.load(before_move_index, Ordering::Relaxed) == 1 && wdl_tb.load(before_move_index, Ordering::Relaxed).unwrap() == WDL::Win {
                 let mut position = Position::from_board_and_player(
                     position_index::index_to_board(before_move_index as u64, piece_count), Player::Blue);
                 for m in position.legal_moves().collect::<Vec<_>>() {
@@ -507,10 +395,10 @@ fn compute_dtm(forward_piece_count: PieceCount, inverse_piece_count: PieceCount,
 
                     match outcome {
                         Some(Outcome::Win(Player::Blue)) => {
-                            tb.dtm[before_move_index].store(1, Ordering::Relaxed);
+                            dtm_tb.store(before_move_index, 1, Ordering::Relaxed);
                             iter_backward_move_indexes(piece_count, opposite_piece_count, &mut position.board,
                                 |after_backward_move_index| {
-                                    opposite_queue.insert(after_backward_move_index as usize);
+                                    opposite_queue.insert(after_backward_move_index);
                                 });
                             return;
                         },
@@ -531,18 +419,18 @@ fn compute_dtm(forward_piece_count: PieceCount, inverse_piece_count: PieceCount,
     while made_progress {
         ply_threshold += 1;
         made_progress = [false, true].into_par_iter().with_max_len(1).map(|is_inverse| {
-            let (tb, opposite_tb, piece_count, opposite_piece_count, queue, opposite_queue) = if is_inverse {
-                (&*inverse_tb, &*forward_tb, inverse_piece_count, forward_piece_count, &inverse_queue, &forward_queue)
+            let (wdl_tb, dtm_tb, opposite_wdl_tb, opposite_dtm_tb, piece_count, opposite_piece_count, queue, opposite_queue) = if is_inverse {
+                (&*inverse_wdl_tb, &*inverse_dtm_tb, &*forward_wdl_tb, &*forward_dtm_tb, inverse_piece_count, forward_piece_count, &inverse_queue, &forward_queue)
             } else {
-                (&*forward_tb, &*inverse_tb, forward_piece_count, inverse_piece_count, &forward_queue, &inverse_queue)
+                (&*forward_wdl_tb, &*forward_dtm_tb, &*inverse_wdl_tb, &*inverse_dtm_tb, forward_piece_count, inverse_piece_count, &forward_queue, &inverse_queue)
             };
             queue.par_drain().map(|before_move_index| {
-                if tb.dtm[before_move_index].load(Ordering::Relaxed) != 0 ||
-                    tb.wdl.get(before_move_index) == WDL::Draw {
+                if dtm_tb.load(before_move_index, Ordering::Relaxed) != 0 ||
+                    wdl_tb.load(before_move_index, Ordering::Relaxed).unwrap() == WDL::Draw {
                     return false;
                 }
 
-                let board = position_index::index_to_board(before_move_index as u64, piece_count);
+                let board = position_index::index_to_board(before_move_index, piece_count);
                 let mut position = Position::from_board_and_player(board, Player::Blue);
                 let mut min_dtm = u16::MAX;
                 let mut max_dtm = 0;
@@ -563,9 +451,9 @@ fn compute_dtm(forward_piece_count: PieceCount, inverse_piece_count: PieceCount,
                             let after_move_index = position_index::board_to_index(
                                 &position.board, after_move_piece_count);
                             if m.is_capture {
-                                let wdl = -disk_tablebase.lookup_wdl_raw(
+                                let wdl = -tablebase_map.lookup_wdl_raw(
                                     after_move_index, after_move_piece_count).unwrap();
-                                let dtm = disk_tablebase.lookup_dtm_raw(
+                                let dtm = tablebase_map.lookup_dtm_raw(
                                     after_move_index, after_move_piece_count).unwrap() + 1;
                                 debug_assert_ne!(dtm, 1); // Because it would be a win_in_one
                                 max_dtm = cmp::max(max_dtm, dtm);
@@ -573,8 +461,8 @@ fn compute_dtm(forward_piece_count: PieceCount, inverse_piece_count: PieceCount,
                                     min_dtm = cmp::min(min_dtm, dtm);
                                 }
                             } else {
-                                let wdl = -opposite_tb.wdl.get(after_move_index as usize);
-                                let dtm = opposite_tb.dtm[after_move_index as usize].load(Ordering::Relaxed) + 1;
+                                let wdl = -opposite_wdl_tb.load(after_move_index, Ordering::Relaxed).unwrap();
+                                let dtm = opposite_dtm_tb.load(after_move_index, Ordering::Relaxed) + 1;
                                 // If the dtm of the child node is unset, treat it as high
                                 let dtm = if dtm == 1 { u16::MAX } else { dtm };
                                 max_dtm = cmp::max(max_dtm, dtm);
@@ -590,12 +478,12 @@ fn compute_dtm(forward_piece_count: PieceCount, inverse_piece_count: PieceCount,
                     position.undo_move(undo_move);
                 }
 
-                let dtm = if tb.wdl.get(before_move_index) == WDL::Win { min_dtm } else { max_dtm };
+                let dtm = if wdl_tb.load(before_move_index, Ordering::Relaxed).unwrap() == WDL::Win { min_dtm } else { max_dtm };
                 if dtm == ply_threshold {
-                    tb.dtm[before_move_index].store(dtm, Ordering::Relaxed);
+                    dtm_tb.store(before_move_index, dtm, Ordering::Relaxed);
                     iter_backward_move_indexes(piece_count, opposite_piece_count, &mut position.board,
                         |after_backward_move_index| {
-                            opposite_queue.insert(after_backward_move_index as usize);
+                            opposite_queue.insert(after_backward_move_index);
                         });
                 } else {
                     // This can happen because of concurrent processing racing one section of
@@ -610,120 +498,99 @@ fn compute_dtm(forward_piece_count: PieceCount, inverse_piece_count: PieceCount,
     }
 
     if cfg!(debug_assertions) {
-        [(&*forward_tb, forward_piece_count), (&*inverse_tb, inverse_piece_count)].into_par_iter().with_max_len(1).for_each(|(tb, pc)| {
-            (0..tb.wdl.len()).into_par_iter().with_min_len(65535).for_each(|index| {
-                if tb.wdl.get(index) == WDL::Draw {
-                    assert_eq!(tb.dtm[index].load(Ordering::Relaxed), 0);
+        [(&*forward_wdl_tb, &*forward_dtm_tb), (&*inverse_wdl_tb, &*inverse_dtm_tb)].into_par_iter().with_max_len(1).for_each(|(wdl_tb, dtm_tb)| {
+            (0..wdl_tb.len()).into_par_iter().for_each(|index| {
+                if wdl_tb.load(index, Ordering::Relaxed).unwrap() == WDL::Draw {
+                    assert_eq!(dtm_tb.load(index, Ordering::Relaxed), 0);
                 } else {
-                    assert_ne!(tb.dtm[index].load(Ordering::Relaxed), 0, "{}", position_index::index_to_board(index as u64, pc).to_fen());
+                    assert_ne!(dtm_tb.load(index, Ordering::Relaxed), 0);
                 }
             });
         });
     }
 }
 
-
-fn gen_tablebase(forward_piece_count: PieceCount, disk_tablebase: &TablebaseMap, enable_dtm: bool) -> (MemTb, MemTb) {
+fn gen_tablebase(forward_piece_count: PieceCount, tablebase_map: &TablebaseMap, opts: &Opts) {
     debug_assert!(normalization::is_count_normalized(forward_piece_count));
     let inverse_piece_count = normalization::normalize_count(forward_piece_count.players_flipped());
 
-    let forward_len = position_index::index_count(forward_piece_count) as usize;
-    let inverse_len = position_index::index_count(inverse_piece_count) as usize;
+    let forward_len = position_index::index_count(forward_piece_count);
+    let inverse_len = position_index::index_count(inverse_piece_count);
     debug_assert_eq!(forward_len, inverse_len);
 
-    let mut forward_tb = MemTb::new(forward_len, enable_dtm);
-    let mut inverse_tb = MemTb::new(inverse_len, enable_dtm);
+    fs::create_dir_all(format!("{}/wip", opts.tablebase_dir)).unwrap();
+    let wip_filename = |piece_count: PieceCount, extension: &str| -> String {
+        format!("{}/wip/{}.tb{}", opts.tablebase_dir, tablebase_name(piece_count), extension)
+    };
+    let mut forward_wdl_tb = WdlTablebaseMut::new(
+        &wip_filename(forward_piece_count, "wdl"), forward_len).unwrap();
+    let mut forward_dtz_tb = DtzTablebaseMut::new(
+        &wip_filename(forward_piece_count, "dtz"), forward_len).unwrap();
+    let mut inverse_wdl_tb = WdlTablebaseMut::new(
+        &wip_filename(inverse_piece_count, "wdl"), inverse_len).unwrap();
+    let mut inverse_dtz_tb = DtzTablebaseMut::new(
+        &wip_filename(inverse_piece_count, "dtz"), inverse_len).unwrap();
 
-    compute_wdl_and_dtz(forward_piece_count, inverse_piece_count,
-        &mut forward_tb, &mut inverse_tb, disk_tablebase);
-    if enable_dtm {
-        compute_dtm(forward_piece_count, inverse_piece_count,
-            &mut forward_tb, &mut inverse_tb, disk_tablebase);
-    }
+    forward_wdl_tb.init();
+    forward_dtz_tb.init();
+    inverse_wdl_tb.init();
+    inverse_dtz_tb.init();
 
-    (forward_tb, inverse_tb)
-}
-
-
-fn output(piece_count: PieceCount, tablebase: &MemTb, opts: &Opts) {
-    match opts.output_format {
-        OutputFormat::Blackhole => (), // Output nothing
-        OutputFormat::Binary => {
-            output_binary(piece_count, tablebase, opts).unwrap();
-        },
-        OutputFormat::Text => {
-            output_text(piece_count, tablebase, opts).unwrap();
-        },
-        OutputFormat::ZlibCompressed => unimplemented!(),
-    }
-}
-
-fn output_text(piece_count: PieceCount, tablebase: &MemTb, opts: &Opts) -> io::Result<()> {
-    fs::create_dir_all(&format!("{}", opts.output_dir))?;
-    let mut file = fs::File::create(
-        &format!("{}/{}.txt", opts.output_dir, tablebase_name(piece_count)))?;
-
-    let len = tablebase.wdl.len();
-    const CHUNK_SIZE: usize = 1 << 16;
-    for chunk_index in 0..((len + CHUNK_SIZE - 1) / CHUNK_SIZE) {
-        let min_index = chunk_index * CHUNK_SIZE;
-        let max_index = cmp::min(min_index + CHUNK_SIZE, len);
-        let s = (min_index..max_index).into_par_iter().map(|index| {
-            let board = position_index::index_to_board(index as u64, piece_count);
-            let wdl = tablebase.wdl.get(index);
-            let dtz = tablebase.dtz[index].load(Ordering::Relaxed);
-            if opts.enable_dtm {
-                let dtm = tablebase.dtm[index].load(Ordering::Relaxed);
-                format!("{} {wdl} {dtz} {dtm}\n", board.to_fen())
-            } else {
-                format!("{} {wdl} {dtz}\n", board.to_fen())
-            }
-        }).reduce(|| String::new(), |a, b| { a + &b });
-        file.write_all(s.as_bytes())?;
-    }
-    Ok(())
-}
-
-fn output_binary(piece_count: PieceCount, tablebase: &MemTb, opts: &Opts) -> io::Result<()> {
-    fs::create_dir_all(&format!("{}", opts.output_dir))?;
-    {
-        let mut file = fs::File::create(
-            format!("{}/{}.tbwdl", opts.output_dir, tablebase_name(piece_count)))?;
-        file.write_all(unsafe {
-            std::slice::from_raw_parts(
-                tablebase.wdl.bytes.as_ptr() as *const u8,
-                tablebase.wdl.bytes.len())
-        })?;
-        file.write_all(&[0u8])?;
-    }
-    {
-        let mut file = fs::File::create(
-            format!("{}/{}.tbdtz", opts.output_dir, tablebase_name(piece_count)))?;
-        file.write_all(unsafe {
-            std::slice::from_raw_parts(
-                tablebase.dtz.as_ptr() as *const u8,
-                tablebase.dtz.len())
-        })?;
-        file.write_all(&[0u8])?;
-    }
+    compute_wdl_and_dtz(forward_piece_count, inverse_piece_count, &mut forward_wdl_tb,
+        &mut forward_dtz_tb, &mut inverse_wdl_tb, &mut inverse_dtz_tb, tablebase_map);
     if opts.enable_dtm {
-        let mut file = fs::File::create(
-            format!("{}/{}.tbdtm", opts.output_dir, tablebase_name(piece_count)))?;
-        // TODO - probably faster way to do this
-        for atomic_ref in &tablebase.dtm {
-            file.write_all(&atomic_ref.load(Ordering::Relaxed).to_le_bytes())?;
-        }
-        file.write_all(&[0u8])?;
+        let mut forward_dtm_tb = DtmTablebaseMut::new(
+            &wip_filename(forward_piece_count, "dtm"), forward_len).unwrap();
+        let mut inverse_dtm_tb = DtmTablebaseMut::new(
+            &wip_filename(inverse_piece_count, "dtm"), inverse_len).unwrap();
+
+        forward_dtm_tb.init();
+        inverse_dtm_tb.init();
+
+        compute_dtm(forward_piece_count, inverse_piece_count,
+            &forward_wdl_tb, &forward_dtz_tb, &mut forward_dtm_tb,
+            &inverse_wdl_tb, &inverse_dtz_tb, &mut inverse_dtm_tb, tablebase_map);
+
+        rayon::scope(|scope| {
+            scope.spawn(move |_| { forward_dtm_tb.flush().unwrap() });
+            scope.spawn(move |_| { inverse_dtm_tb.flush().unwrap() });
+        });
     }
-    Ok(())
+
+    rayon::scope(|scope| {
+        scope.spawn(move |_| { forward_wdl_tb.flush().unwrap() });
+        scope.spawn(move |_| { forward_dtz_tb.flush().unwrap() });
+        scope.spawn(move |_| { inverse_wdl_tb.flush().unwrap() });
+        scope.spawn(move |_| { inverse_dtz_tb.flush().unwrap() });
+    });
+
+    let dest_filename = |piece_count: PieceCount, extension: &str| -> String {
+        format!("{}/{}.tb{}", opts.tablebase_dir, tablebase_name(piece_count), extension)
+    };
+    let mut piece_counts = vec![forward_piece_count];
+    if inverse_piece_count != forward_piece_count {
+        // Symmetric piece counts can be generated as if they are two separate files but we can
+        // only rename the file once
+        piece_counts.push(inverse_piece_count);
+    }
+    let mut extensions = vec!["wdl", "dtz"];
+    if opts.enable_dtm {
+        extensions.push("dtm");
+    }
+    for piece_count in piece_counts {
+        for extension in &extensions {
+            fs::rename(wip_filename(piece_count, extension), dest_filename(piece_count, extension)).unwrap();
+        }
+    }
 }
+
 
 fn parse_command_line_args() -> Opts {
     let mut opts = Opts {
         upto_pieces: 0,
         enable_dtm: false,
-        output_dir: "data/tablebase".to_string(),
-        output_format: OutputFormat::Binary, // TODO - default to ZlibCompressed when implemented
+        tablebase_dir: "data/tablebase".to_string(),
+        compressed_output: false,
         num_threads: 0, // If 0, num_cpus is used
     };
 
@@ -735,17 +602,11 @@ fn parse_command_line_args() -> Opts {
                 opts.upto_pieces = args.next().unwrap().parse().unwrap();
             },
             "--enable_dtm" | "--enable-dtm" | "--dtm" => opts.enable_dtm = true,
-            "--directory" | "--dir" | "--output_dir" | "--output-dir" => {
-                opts.output_dir = args.next().unwrap().to_string();
+            "--directory" | "--dir" | "--tablebase_dir" | "--tablebase-dir" => {
+                opts.tablebase_dir = args.next().unwrap().to_string();
             },
-            "--format" | "--output_format" | "--output-format" => {
-                opts.output_format = match args.next().unwrap().as_str() {
-                    "none" | "blackhole" => OutputFormat::Blackhole,
-                    "binary" | "bin" => OutputFormat::Binary,
-                    "compressed" | "zlib-compressed" => OutputFormat::ZlibCompressed,
-                    "text" | "fen" | "txt" => OutputFormat::Text,
-                    f => panic!("unknown output format: {}", f),
-                };
+            "--compress" | "--compressed" => {
+                opts.compressed_output = true;
             },
             "--threads" | "--num_threads" | "--num-threads" => {
                 opts.num_threads = args.next().unwrap().parse().unwrap();

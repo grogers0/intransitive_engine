@@ -2,13 +2,13 @@ pub mod combinatorics;
 pub mod normalization;
 pub mod piece_count;
 pub mod position_index;
-pub mod tablebase_map;
+pub mod tablebase;
 pub mod validation;
 pub mod atomic_bitset;
 
 pub use piece_count::PieceCount;
 pub use normalization::{normalize_position, normalize_board, undo_normalize_position, undo_normalize_board, is_normalized};
-pub use tablebase_map::TablebaseMap;
+pub use tablebase::TablebaseMap;
 pub use atomic_bitset::AtomicBitset;
 
 use std::{ops, fmt};

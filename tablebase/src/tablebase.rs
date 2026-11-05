@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io;
+use std::sync::atomic::{AtomicU8, AtomicU16, Ordering};
 
 use crate::{WDL, PieceCount, normalization, position_index};
 use base::{Value, Position, Player, Piece, MAX_PLY};
-use memmap2::Mmap;
+use memmap2::{Mmap, MmapMut};
+use rayon::prelude::*;
 
 pub struct TablebaseMap {
     max_piece_total: u8,
@@ -62,7 +64,6 @@ impl TablebaseMap {
                 }
                 let file = fs::File::open(&path)?;
                 let mmap = unsafe { Mmap::map(&file)? };
-                assert_eq!(mmap[mmap.len() - 1], 0); // Only mode 0 supported right now
                 tablebase_map.insert(piece_count, mmap);
                 self.max_piece_total = std::cmp::max(self.max_piece_total, piece_count.total()); 
             }
@@ -126,7 +127,7 @@ impl TablebaseMap {
         (index, piece_count)
     }
 
-    // Raw APIs used by the generator, not indended to be used by search
+    // Raw APIs used by the generator, not intended to be used by search
     pub fn lookup_wdl_raw(&self, index: u64, piece_count: PieceCount) -> Option<WDL> {
         self.wdl.get(&piece_count).map(|wdl_mmap| {
             let byte_idx = (index as usize) >> 2;
@@ -153,5 +154,164 @@ impl TablebaseMap {
     }
     pub fn get_covered_piece_counts(&self) -> Vec<PieceCount> {
         self.wdl.keys().cloned().collect()
+    }
+}
+
+fn open_mmap_mut<'a, T>(filename: &str, len_bytes: u64) -> io::Result<(MmapMut, &'a [T])> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(filename)?;
+    file.set_len(len_bytes)?;
+    let mmap = unsafe { MmapMut::map_mut(&file)? };
+    let len = mmap.len() / std::mem::size_of::<T>();
+    let slice: &[T] = unsafe { std::slice::from_raw_parts(mmap.as_ptr() as *const T, len) };
+    Ok((mmap, slice))
+}
+
+fn par_memset(slice: &mut [u8], val: u8) {
+    slice.par_chunks_mut(8 * 1024 * 1024).for_each(|chunk| chunk.fill(val));
+}
+
+pub struct WdlTablebaseMut<'a> {
+    mmap: MmapMut,
+    slice: &'a [AtomicU8],
+    len: u64,
+}
+
+impl <'a> WdlTablebaseMut<'a> {
+    pub fn new(filename: &str, len: u64) -> io::Result<Self> {
+        let (mmap, slice) = open_mmap_mut(filename, (len + 3) / 4)?;
+        Ok(Self { mmap, slice, len })
+    }
+
+    pub fn init(&mut self) {
+        par_memset(&mut self.mmap, 0xff);
+    }
+
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub fn load(&self, index: u64, ordering: Ordering) -> Option<WDL> {
+        debug_assert!(index < self.len);
+        let byte_offset = index >> 2;
+        let bit_offset = (index & 0x03) << 1;
+        let atom_ref: &AtomicU8 = unsafe { self.slice.get_unchecked(byte_offset as usize) };
+        let byte_val = atom_ref.load(ordering);
+        match (byte_val >> bit_offset) & 0x03 {
+            0 => Some(WDL::Loss),
+            1 => Some(WDL::Draw),
+            2 => Some(WDL::Win),
+            3 => None,
+            _ => unreachable!(),
+        }
+    }
+
+    pub fn store(&self, index: u64, wdl: WDL, ordering: Ordering) {
+        debug_assert!(index < self.len);
+        let byte_offset = index >> 2;
+        let bit_offset = (index & 0x03) << 1;
+        let atom_ref: &AtomicU8 = unsafe { self.slice.get_unchecked(byte_offset as usize) };
+        let mut prev_byte_val = atom_ref.load(ordering);
+        loop {
+            let mut byte_val = prev_byte_val;
+            byte_val &= !(0x03 << bit_offset);
+            byte_val |= match wdl { WDL::Loss => 0, WDL::Draw => 1, WDL::Win => 2 } << bit_offset;
+            debug_assert!(byte_val == prev_byte_val ||
+                ((prev_byte_val >> bit_offset) & 0x03) == 0x03);
+            let cas_result = atom_ref.compare_exchange_weak(prev_byte_val, byte_val, ordering, ordering);
+            match cas_result {
+                Ok(_) => break,
+                Err(updated_byte_val) => prev_byte_val = updated_byte_val,
+            }
+        }
+    }
+
+    pub fn flush(&mut self) -> io::Result<()> {
+        self.mmap.flush()
+    }
+}
+
+pub struct DtzTablebaseMut<'a> {
+    mmap: MmapMut,
+    slice: &'a [AtomicU8],
+}
+
+impl <'a> DtzTablebaseMut<'a> {
+    pub fn new(filename: &str, len: u64) -> io::Result<Self> {
+        let (mmap, slice) = open_mmap_mut(filename, len)?;
+        Ok(Self { mmap, slice })
+    }
+
+    pub fn init(&mut self) {
+        par_memset(&mut self.mmap, 0);
+    }
+
+    pub fn len(&self) -> u64 {
+        self.slice.len() as u64
+    }
+
+    pub fn load(&self, index: u64, ordering: Ordering) -> u8 {
+        debug_assert!(index < self.len());
+        let atom_ref: &AtomicU8 = unsafe { self.slice.get_unchecked(index as usize) };
+        atom_ref.load(ordering)
+    }
+
+    pub fn store(&self, index: u64, dtz: u8, ordering: Ordering) {
+        debug_assert!(index < self.len());
+        let atom_ref: &AtomicU8 = unsafe { self.slice.get_unchecked(index as usize) };
+        if cfg!(debug_assertions) {
+            let prev_dtz = atom_ref.swap(dtz, ordering);
+            debug_assert!(prev_dtz == 0 || prev_dtz == dtz);
+        } else {
+            atom_ref.store(dtz, ordering);
+        }
+    }
+
+    pub fn flush(&mut self) -> io::Result<()> {
+        self.mmap.flush()
+    }
+}
+
+pub struct DtmTablebaseMut<'a> {
+    mmap: MmapMut,
+    slice: &'a [AtomicU16],
+}
+
+impl <'a> DtmTablebaseMut<'a> {
+    pub fn new(filename: &str, len: u64) -> io::Result<Self> {
+        let (mmap, slice) = open_mmap_mut(filename, len * 2)?;
+        Ok(Self { mmap, slice })
+    }
+
+    pub fn init(&mut self) {
+        par_memset(&mut self.mmap, 0);
+    }
+
+    pub fn len(&self) -> u64 {
+        self.slice.len() as u64
+    }
+
+    pub fn load(&self, index: u64, ordering: Ordering) -> u16 {
+        debug_assert!(index < self.len());
+        let atom_ref: &AtomicU16 = unsafe { self.slice.get_unchecked(index as usize) };
+        u16::from_le(atom_ref.load(ordering))
+    }
+
+    pub fn store(&self, index: u64, dtm: u16, ordering: Ordering) {
+        debug_assert!(index < self.len());
+        let atom_ref: &AtomicU16 = unsafe { self.slice.get_unchecked(index as usize) };
+        if cfg!(debug_assertions) {
+            let prev_dtm = u16::from_le(atom_ref.swap(dtm.to_le(), ordering));
+            debug_assert!(prev_dtm == 0 || prev_dtm == dtm);
+        } else {
+            atom_ref.store(dtm.to_le(), ordering);
+        }
+    }
+
+    pub fn flush(&mut self) -> io::Result<()> {
+        self.mmap.flush()
     }
 }
