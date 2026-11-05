@@ -2,6 +2,8 @@ use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::cmp;
 use std::fs;
+use std::io;
+use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
 use tablebase::{PieceCount, WDL, position_index, normalization, tablebase_name, TablebaseMap, validation, AtomicBitset};
@@ -14,6 +16,7 @@ struct Opts {
     tablebase_dir: String,
     compressed_output: bool,
     num_threads: usize,
+    checkpoint_interval: Duration,
 }
 
 fn main() {
@@ -41,6 +44,62 @@ fn main() {
         validation::validate_tablebase(&tablebase_map, !opts.enable_dtm);
     }
 }
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum CheckpointMode {
+    WdlDtz,
+    Dtm,
+}
+#[derive(Copy, Clone, Eq, PartialEq)]
+struct Checkpoint {
+    mode: CheckpointMode,
+    ply_threshold: u16,
+}
+
+fn store_checkpoint(tablebase_dir: &str, piece_count: PieceCount, checkpoint: Checkpoint) {
+    use io::Write;
+    let filename = format!("{}/wip/{}.wip", tablebase_dir, tablebase_name(piece_count));
+    let tmp_filename = format!("{}.tmp", filename);
+    let mut file = fs::File::create(&tmp_filename).unwrap();
+    writeln!(file, "{}", match checkpoint.mode {
+        CheckpointMode::WdlDtz => "wdl",
+        CheckpointMode::Dtm => "dtm",
+    }).unwrap();
+    writeln!(file, "{}", checkpoint.ply_threshold).unwrap();
+    file.sync_all().unwrap();
+    std::mem::drop(file);
+    fs::rename(tmp_filename, filename).unwrap();
+}
+
+fn remove_checkpoint(tablebase_dir: &str, piece_count: PieceCount) {
+    let filename = format!("{}/wip/{}.wip", tablebase_dir, tablebase_name(piece_count));
+    match fs::remove_file(filename) {
+        Ok(_) => (),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => (), // We only insert checkpoints once we get slow enough
+        Err(e) => panic!("{}", e),
+    }
+}
+
+fn load_checkpoint(tablebase_dir: &str, piece_count: PieceCount) -> Option<Checkpoint> {
+    use std::io::BufRead;
+    let filename = format!("{}/wip/{}.wip", tablebase_dir, tablebase_name(piece_count));
+    let file = fs::File::open(filename);
+    let file = match file {
+        Ok(file) => file,
+        Err(_) => return None,
+    };
+    let reader = io::BufReader::new(file);
+    let mut lines = reader.lines();
+    let mode = match lines.next().unwrap().unwrap().as_str() {
+        "wdl" => CheckpointMode::WdlDtz,
+        "dtm" => CheckpointMode::Dtm,
+        _ => panic!(),
+    };
+    let ply_threshold = lines.next().unwrap().unwrap().parse().unwrap();
+    assert!(lines.next().is_none());
+    Some(Checkpoint { mode, ply_threshold })
+}
+
 
 fn tablebase_already_generated(piece_count: PieceCount, tablebase_map: &TablebaseMap, enable_dtm: bool) -> bool {
     tablebase_map.lookup_wdl_raw(0, piece_count).is_some() &&
@@ -221,21 +280,48 @@ fn initialize_roots<'a>(piece_count: PieceCount, wdl_tb: &'a WdlTablebaseMut, qu
 fn compute_wdl_and_dtz(forward_piece_count: PieceCount, inverse_piece_count: PieceCount,
     forward_wdl_tb: &mut WdlTablebaseMut, forward_dtz_tb: &mut DtzTablebaseMut,
     inverse_wdl_tb: &mut WdlTablebaseMut, inverse_dtz_tb: &mut DtzTablebaseMut,
-    tablebase_map: &TablebaseMap) {
+    tablebase_map: &TablebaseMap, completed_ply_threshold: u8, opts: &Opts) {
+    let mut last_checkpoint = Instant::now();
 
     let forward_queue = AtomicBitset::new(forward_wdl_tb.len());
     let inverse_queue = AtomicBitset::new(inverse_wdl_tb.len());
 
-    rayon::scope(|scope| {
-        scope.spawn(|scope|
-            initialize_roots(forward_piece_count, forward_wdl_tb, &forward_queue, scope));
-        initialize_roots(inverse_piece_count, inverse_wdl_tb, &inverse_queue, scope);
-    });
+    if completed_ply_threshold > 0 {
+        [false, true].into_par_iter().with_max_len(1).for_each(|is_inverse| {
+            let (dtz_tb, piece_count, opposite_piece_count, opposite_queue) = if is_inverse {
+                (&*inverse_dtz_tb, inverse_piece_count, forward_piece_count, &forward_queue)
+            } else {
+                (&*forward_dtz_tb, forward_piece_count, inverse_piece_count, &inverse_queue)
+            };
+
+            (0..dtz_tb.len()).into_par_iter().for_each(|before_move_index| {
+                if dtz_tb.load(before_move_index, Ordering::Relaxed) == completed_ply_threshold {
+                    let mut board = position_index::index_to_board(before_move_index, piece_count);
+                    iter_backward_move_indexes(piece_count, opposite_piece_count, &mut board,
+                        |after_backward_move_index| {
+                            opposite_queue.insert(after_backward_move_index);
+                        });
+                }
+            });
+        });
+    } else {
+        rayon::scope(|scope| {
+            scope.spawn(|_| forward_wdl_tb.init());
+            scope.spawn(|_| forward_dtz_tb.init());
+            scope.spawn(|_| inverse_wdl_tb.init());
+            scope.spawn(|_| inverse_dtz_tb.init());
+        });
+
+        rayon::scope(|scope| {
+            scope.spawn(|scope|
+                initialize_roots(forward_piece_count, forward_wdl_tb, &forward_queue, scope));
+            initialize_roots(inverse_piece_count, inverse_wdl_tb, &inverse_queue, scope);
+        });
+    }
 
     let mut made_progress = true;
-    let mut ply_threshold = 0;
+    let mut ply_threshold = completed_ply_threshold + 1;
     while made_progress {
-        ply_threshold += 1;
         made_progress = [false, true].into_par_iter().with_max_len(1).map(|is_inverse| {
             let (wdl_tb, dtz_tb, opposite_wdl_tb, opposite_dtz_tb, piece_count, opposite_piece_count, queue, opposite_queue) = if is_inverse {
                 (&*inverse_wdl_tb, &*inverse_dtz_tb, &*forward_wdl_tb, &*forward_dtz_tb, inverse_piece_count, forward_piece_count, &inverse_queue, &forward_queue)
@@ -244,7 +330,10 @@ fn compute_wdl_and_dtz(forward_piece_count: PieceCount, inverse_piece_count: Pie
             };
             queue.par_drain().map(|before_move_index| {
                 if let Some(_) = wdl_tb.load(before_move_index, Ordering::Relaxed) {
-                    return false;
+                    let dtz = dtz_tb.load(before_move_index, Ordering::Relaxed);
+                    if dtz < ply_threshold {
+                        return false;
+                    }
                 }
 
                 let board = position_index::index_to_board(before_move_index as u64, piece_count);
@@ -350,6 +439,15 @@ fn compute_wdl_and_dtz(forward_piece_count: PieceCount, inverse_piece_count: Pie
                 }
             }).reduce(|| false, |a, b| a || b)
         }).reduce(|| false, |a, b| a || b);
+
+        let now = Instant::now();
+        if now - last_checkpoint > opts.checkpoint_interval {
+            store_checkpoint(&opts.tablebase_dir, forward_piece_count,
+                Checkpoint { mode: CheckpointMode::WdlDtz, ply_threshold: ply_threshold as u16 });
+            last_checkpoint = now;
+        }
+
+        ply_threshold += 1;
     }
 
     [(&*forward_wdl_tb, &*forward_dtz_tb), (&*inverse_wdl_tb, &*inverse_dtz_tb)].par_iter().with_max_len(1).for_each(|(wdl_tb, dtz_tb)| {
@@ -370,54 +468,83 @@ fn compute_wdl_and_dtz(forward_piece_count: PieceCount, inverse_piece_count: Pie
 fn compute_dtm(forward_piece_count: PieceCount, inverse_piece_count: PieceCount,
     forward_wdl_tb: &WdlTablebaseMut, forward_dtz_tb: &DtzTablebaseMut, forward_dtm_tb: &mut DtmTablebaseMut,
     inverse_wdl_tb: &WdlTablebaseMut, inverse_dtz_tb: &DtzTablebaseMut, inverse_dtm_tb: &mut DtmTablebaseMut,
-    tablebase_map: &TablebaseMap) {
+    tablebase_map: &TablebaseMap, completed_ply_threshold: u16, opts: &Opts) {
+    let mut last_checkpoint = Instant::now();
 
     let forward_queue = AtomicBitset::new(forward_wdl_tb.len());
     let inverse_queue = AtomicBitset::new(inverse_wdl_tb.len());
 
-    [false, true].into_par_iter().with_max_len(1).for_each(|is_inverse| {
-        let (wdl_tb, dtz_tb, dtm_tb, piece_count, opposite_piece_count, opposite_queue, queue) = if is_inverse {
-            (&*inverse_wdl_tb, &*inverse_dtz_tb, &*inverse_dtm_tb, inverse_piece_count, forward_piece_count, &forward_queue, &inverse_queue)
-        } else {
-            (&*forward_wdl_tb, &*forward_dtz_tb, &*forward_dtm_tb, forward_piece_count, inverse_piece_count, &inverse_queue, &forward_queue)
-        };
+    if completed_ply_threshold > 0 {
+        [false, true].into_par_iter().with_max_len(1).for_each(|is_inverse| {
+            let (wdl_tb, dtz_tb, dtm_tb, piece_count, opposite_piece_count, opposite_queue, queue) = if is_inverse {
+                (&*inverse_wdl_tb, &*inverse_dtz_tb, &*inverse_dtm_tb, inverse_piece_count, forward_piece_count, &forward_queue, &inverse_queue)
+            } else {
+                (&*forward_wdl_tb, &*forward_dtz_tb, &*forward_dtm_tb, forward_piece_count, inverse_piece_count, &inverse_queue, &forward_queue)
+            };
 
-        // All wins in 1 dtz are roots for the dtm search. This is slower than re-enumerating the
-        // roots but saves code complexity
-        (0..wdl_tb.len()).into_par_iter().for_each(|before_move_index| {
-            if dtz_tb.load(before_move_index, Ordering::Relaxed) == 1 && wdl_tb.load(before_move_index, Ordering::Relaxed).unwrap() == WDL::Win {
-                let mut position = Position::from_board_and_player(
-                    position_index::index_to_board(before_move_index as u64, piece_count), Player::Blue);
-                for m in position.legal_moves().collect::<Vec<_>>() {
-                    let undo_move = position.make_move(m);
-                    let outcome = position.get_outcome();
-                    position.undo_move(undo_move);
-
-                    match outcome {
-                        Some(Outcome::Win(Player::Blue)) => {
-                            dtm_tb.store(before_move_index, 1, Ordering::Relaxed);
-                            iter_backward_move_indexes(piece_count, opposite_piece_count, &mut position.board,
-                                |after_backward_move_index| {
-                                    opposite_queue.insert(after_backward_move_index);
-                                });
-                            return;
-                        },
-                        Some(Outcome::Win(Player::Red)) => unreachable!(),
-                        Some(Outcome::Draw) => unreachable!(),
-                        None => (),
-                    }
+            (0..wdl_tb.len()).into_par_iter().for_each(|before_move_index| {
+                if dtm_tb.load(before_move_index, Ordering::Relaxed) == completed_ply_threshold {
+                    let mut board = position_index::index_to_board(before_move_index, piece_count);
+                    iter_backward_move_indexes(piece_count, opposite_piece_count, &mut board,
+                        |after_backward_move_index| {
+                            opposite_queue.insert(after_backward_move_index);
+                        });
+                } else if dtz_tb.load(before_move_index, Ordering::Relaxed) == 1 && wdl_tb.load(before_move_index, Ordering::Relaxed).unwrap() == WDL::Win {
+                    // When resuming, retry the win with dtz == 1 roots in case dtm hasn't been completed for that node
+                    queue.insert(before_move_index);
                 }
-                // Must sit in the queue until dtm == ply_threshold or a
-                // faster path is found
-                queue.insert(before_move_index);
-            }
+            });
         });
-    });
+    } else {
+        rayon::scope(|scope| {
+            scope.spawn(|_| forward_dtm_tb.init());
+            scope.spawn(|_| inverse_dtm_tb.init());
+        });
+        [false, true].into_par_iter().with_max_len(1).for_each(|is_inverse| {
+            let (wdl_tb, dtz_tb, dtm_tb, piece_count, opposite_piece_count, opposite_queue, queue) = if is_inverse {
+                (&*inverse_wdl_tb, &*inverse_dtz_tb, &*inverse_dtm_tb, inverse_piece_count, forward_piece_count, &forward_queue, &inverse_queue)
+            } else {
+                (&*forward_wdl_tb, &*forward_dtz_tb, &*forward_dtm_tb, forward_piece_count, inverse_piece_count, &inverse_queue, &forward_queue)
+            };
+
+            // All wins or losses in 1 dtz are roots for the dtm search. This is slower than
+            // re-enumerating the roots but saves code complexity. We don't need to explicitly
+            // handle DTM=0 wins or losses since the DTM is initialized to 0, and we handle any
+            // DTM=1 cases to propagate backwards.
+            (0..wdl_tb.len()).into_par_iter().for_each(|before_move_index| {
+                if dtz_tb.load(before_move_index, Ordering::Relaxed) == 1 && wdl_tb.load(before_move_index, Ordering::Relaxed).unwrap() != WDL::Draw {
+                    let mut position = Position::from_board_and_player(
+                        position_index::index_to_board(before_move_index as u64, piece_count), Player::Blue);
+                    for m in position.legal_moves().collect::<Vec<_>>() {
+                        let undo_move = position.make_move(m);
+                        let outcome = position.get_outcome();
+                        position.undo_move(undo_move);
+
+                        match outcome {
+                            Some(Outcome::Win(Player::Blue)) => {
+                                dtm_tb.store(before_move_index, 1, Ordering::Relaxed);
+                                iter_backward_move_indexes(piece_count, opposite_piece_count, &mut position.board,
+                                    |after_backward_move_index| {
+                                        opposite_queue.insert(after_backward_move_index);
+                                    });
+                                return;
+                            },
+                            Some(Outcome::Win(Player::Red)) => unreachable!(),
+                            Some(Outcome::Draw) => unreachable!(),
+                            None => (),
+                        }
+                    }
+                    // Must sit in the queue until dtm == ply_threshold or a
+                    // faster path is found
+                    queue.insert(before_move_index);
+                }
+            });
+        });
+    }
 
     let mut made_progress = true;
-    let mut ply_threshold = 1;
+    let mut ply_threshold = if completed_ply_threshold == 0 { 2 } else { completed_ply_threshold + 1 };
     while made_progress {
-        ply_threshold += 1;
         made_progress = [false, true].into_par_iter().with_max_len(1).map(|is_inverse| {
             let (wdl_tb, dtm_tb, opposite_wdl_tb, opposite_dtm_tb, piece_count, opposite_piece_count, queue, opposite_queue) = if is_inverse {
                 (&*inverse_wdl_tb, &*inverse_dtm_tb, &*forward_wdl_tb, &*forward_dtm_tb, inverse_piece_count, forward_piece_count, &inverse_queue, &forward_queue)
@@ -425,8 +552,11 @@ fn compute_dtm(forward_piece_count: PieceCount, inverse_piece_count: PieceCount,
                 (&*forward_wdl_tb, &*forward_dtm_tb, &*inverse_wdl_tb, &*inverse_dtm_tb, forward_piece_count, inverse_piece_count, &forward_queue, &inverse_queue)
             };
             queue.par_drain().map(|before_move_index| {
-                if dtm_tb.load(before_move_index, Ordering::Relaxed) != 0 ||
-                    wdl_tb.load(before_move_index, Ordering::Relaxed).unwrap() == WDL::Draw {
+                if wdl_tb.load(before_move_index, Ordering::Relaxed).unwrap() == WDL::Draw {
+                    return false;
+                }
+                let dtm = dtm_tb.load(before_move_index, Ordering::Relaxed);
+                if dtm != 0 && dtm < ply_threshold {
                     return false;
                 }
 
@@ -495,6 +625,15 @@ fn compute_dtm(forward_piece_count: PieceCount, inverse_piece_count: PieceCount,
                 true
             }).reduce(|| false, |a, b| a || b)
         }).reduce(|| false, |a, b| a || b);
+
+        let now = Instant::now();
+        if now - last_checkpoint > opts.checkpoint_interval {
+            store_checkpoint(&opts.tablebase_dir, forward_piece_count,
+                Checkpoint { mode: CheckpointMode::Dtm, ply_threshold });
+            last_checkpoint = now;
+        }
+
+        ply_threshold += 1;
     }
 
     if cfg!(debug_assertions) {
@@ -531,25 +670,35 @@ fn gen_tablebase(forward_piece_count: PieceCount, tablebase_map: &TablebaseMap, 
     let mut inverse_dtz_tb = DtzTablebaseMut::new(
         &wip_filename(inverse_piece_count, "dtz"), inverse_len).unwrap();
 
-    forward_wdl_tb.init();
-    forward_dtz_tb.init();
-    inverse_wdl_tb.init();
-    inverse_dtz_tb.init();
+    let mut checkpoint = load_checkpoint(&opts.tablebase_dir, forward_piece_count);
+    if checkpoint.is_none() || checkpoint.unwrap().mode == CheckpointMode::WdlDtz {
+        let completed_ply_threshold = checkpoint.map(|cp| cp.ply_threshold as u8).unwrap_or(0);
+        compute_wdl_and_dtz(forward_piece_count, inverse_piece_count,
+            &mut forward_wdl_tb, &mut forward_dtz_tb, &mut inverse_wdl_tb, &mut inverse_dtz_tb,
+            tablebase_map, completed_ply_threshold, opts);
 
-    compute_wdl_and_dtz(forward_piece_count, inverse_piece_count, &mut forward_wdl_tb,
-        &mut forward_dtz_tb, &mut inverse_wdl_tb, &mut inverse_dtz_tb, tablebase_map);
+        rayon::scope(|scope| {
+            scope.spawn(|_| { forward_wdl_tb.flush().unwrap() });
+            scope.spawn(|_| { forward_dtz_tb.flush().unwrap() });
+            scope.spawn(|_| { inverse_wdl_tb.flush().unwrap() });
+            scope.spawn(|_| { inverse_dtz_tb.flush().unwrap() });
+        });
+
+        checkpoint = Some(Checkpoint { mode: CheckpointMode::Dtm, ply_threshold: 0 });
+    }
     if opts.enable_dtm {
+        assert!(checkpoint.is_none() || checkpoint.unwrap().mode == CheckpointMode::Dtm);
+
         let mut forward_dtm_tb = DtmTablebaseMut::new(
             &wip_filename(forward_piece_count, "dtm"), forward_len).unwrap();
         let mut inverse_dtm_tb = DtmTablebaseMut::new(
             &wip_filename(inverse_piece_count, "dtm"), inverse_len).unwrap();
 
-        forward_dtm_tb.init();
-        inverse_dtm_tb.init();
-
+        let completed_ply_threshold = checkpoint.map(|cp| cp.ply_threshold).unwrap_or(0);
         compute_dtm(forward_piece_count, inverse_piece_count,
             &forward_wdl_tb, &forward_dtz_tb, &mut forward_dtm_tb,
-            &inverse_wdl_tb, &inverse_dtz_tb, &mut inverse_dtm_tb, tablebase_map);
+            &inverse_wdl_tb, &inverse_dtz_tb, &mut inverse_dtm_tb,
+            tablebase_map, completed_ply_threshold, opts);
 
         rayon::scope(|scope| {
             scope.spawn(move |_| { forward_dtm_tb.flush().unwrap() });
@@ -557,12 +706,7 @@ fn gen_tablebase(forward_piece_count: PieceCount, tablebase_map: &TablebaseMap, 
         });
     }
 
-    rayon::scope(|scope| {
-        scope.spawn(move |_| { forward_wdl_tb.flush().unwrap() });
-        scope.spawn(move |_| { forward_dtz_tb.flush().unwrap() });
-        scope.spawn(move |_| { inverse_wdl_tb.flush().unwrap() });
-        scope.spawn(move |_| { inverse_dtz_tb.flush().unwrap() });
-    });
+    remove_checkpoint(&opts.tablebase_dir, forward_piece_count);
 
     let dest_filename = |piece_count: PieceCount, extension: &str| -> String {
         format!("{}/{}.tb{}", opts.tablebase_dir, tablebase_name(piece_count), extension)
@@ -592,6 +736,7 @@ fn parse_command_line_args() -> Opts {
         tablebase_dir: "data/tablebase".to_string(),
         compressed_output: false,
         num_threads: 0, // If 0, num_cpus is used
+        checkpoint_interval: Duration::from_secs(60),
     };
 
     let mut args = std::env::args();
@@ -610,6 +755,9 @@ fn parse_command_line_args() -> Opts {
             },
             "--threads" | "--num_threads" | "--num-threads" => {
                 opts.num_threads = args.next().unwrap().parse().unwrap();
+            },
+            "--checkpoint_secs" | "--checkpoint-secs" => {
+                opts.checkpoint_interval = Duration::from_secs(args.next().unwrap().parse().unwrap());
             },
             _ => {
                 panic!("unknown command line argument \"{}\"", token);
