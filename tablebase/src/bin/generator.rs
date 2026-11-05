@@ -5,7 +5,7 @@ use std::fs;
 use std::io::{self, Write};
 
 use rayon::prelude::*;
-use tablebase::{PieceCount, WDL, position_index, normalization, tablebase_name, Tablebase, validation, AtomicBitset};
+use tablebase::{PieceCount, WDL, position_index, normalization, tablebase_name, TablebaseMap, validation, AtomicBitset};
 use base::{AdjacentLocs, Board, Cell, Outcome, Piece, Player, Position};
 
 struct Opts {
@@ -124,7 +124,7 @@ fn main() {
     let opts = parse_command_line_args();
     init_threads(&opts);
 
-    let mut disk_tablebase = Tablebase::new(&opts.output_dir);
+    let mut disk_tablebase = TablebaseMap::new(&opts.output_dir);
     for total_count in 0..=opts.upto_pieces {
         rayon::scope(|scope| {
             let mut already_generated = HashSet::new();
@@ -158,7 +158,7 @@ fn main() {
     }
 }
 
-fn tablebase_already_generated(piece_count: PieceCount, disk_tablebase: &Tablebase, enable_dtm: bool) -> bool {
+fn tablebase_already_generated(piece_count: PieceCount, disk_tablebase: &TablebaseMap, enable_dtm: bool) -> bool {
     disk_tablebase.lookup_wdl_raw(0, piece_count).is_some() &&
         disk_tablebase.lookup_dtz_raw(0, piece_count).is_some() &&
         (!enable_dtm || disk_tablebase.lookup_dtm_raw(0, piece_count).is_some())
@@ -335,7 +335,7 @@ fn initialize_roots<'a>(piece_count: PieceCount, tb: &'a MemTb, queue: &'a Atomi
 }
 
 fn compute_wdl_and_dtz(forward_piece_count: PieceCount, inverse_piece_count: PieceCount,
-    forward_tb: &mut MemTb, inverse_tb: &mut MemTb, disk_tablebase: &Tablebase) {
+    forward_tb: &mut MemTb, inverse_tb: &mut MemTb, disk_tablebase: &TablebaseMap) {
 
     let forward_queue = AtomicBitset::new(forward_tb.wdl.len());
     let inverse_queue = AtomicBitset::new(inverse_tb.wdl.len());
@@ -482,7 +482,7 @@ fn compute_wdl_and_dtz(forward_piece_count: PieceCount, inverse_piece_count: Pie
 
 // Computing DTM has to re-visit nodes and is slower
 fn compute_dtm(forward_piece_count: PieceCount, inverse_piece_count: PieceCount,
-    forward_tb: &mut MemTb, inverse_tb: &mut MemTb, disk_tablebase: &Tablebase) {
+    forward_tb: &mut MemTb, inverse_tb: &mut MemTb, disk_tablebase: &TablebaseMap) {
 
     let forward_queue = AtomicBitset::new(forward_tb.wdl.len());
     let inverse_queue = AtomicBitset::new(inverse_tb.wdl.len());
@@ -623,7 +623,7 @@ fn compute_dtm(forward_piece_count: PieceCount, inverse_piece_count: PieceCount,
 }
 
 
-fn gen_tablebase(forward_piece_count: PieceCount, disk_tablebase: &Tablebase, enable_dtm: bool) -> (MemTb, MemTb) {
+fn gen_tablebase(forward_piece_count: PieceCount, disk_tablebase: &TablebaseMap, enable_dtm: bool) -> (MemTb, MemTb) {
     debug_assert!(normalization::is_count_normalized(forward_piece_count));
     let inverse_piece_count = normalization::normalize_count(forward_piece_count.players_flipped());
 

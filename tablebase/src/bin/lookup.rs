@@ -1,7 +1,7 @@
 use std::iter;
 
 use base::{Board, Position, Player};
-use tablebase::Tablebase;
+use tablebase::TablebaseMap;
 
 struct Opts {
     dir: String,
@@ -10,14 +10,14 @@ struct Opts {
 
 fn main() {
     let opts = parse_command_line_args();
-    let tb = Tablebase::new(&opts.dir);
+    let tablebase_map = TablebaseMap::new(&opts.dir);
 
     if let Some(pos) = opts.position {
-        lookup_and_print(pos.clone(), &tb);
+        lookup_and_print(pos.clone(), &tablebase_map);
     } else {
         for line in std::io::stdin().lines() {
             let pos = parse_position(line.unwrap().split_whitespace().map(|s| s.to_string()));
-            lookup_and_print(pos, &tb);
+            lookup_and_print(pos, &tablebase_map);
         }
     }
 }
@@ -29,8 +29,8 @@ fn to_player_str(pos: &Position) -> &'static str {
     }
 }
 
-fn lookup_and_print(mut pos: Position, tb: &Tablebase) {
-    if let Some(v) = tb.lookup_slow(&mut pos) {
+fn lookup_and_print(mut pos: Position, tablebase_map: &TablebaseMap) {
+    if let Some(v) = tablebase_map.lookup_slow(&mut pos) {
         println!("{} {} {}", pos.board.to_fen(), to_player_str(&pos), v);
     } else {
         println!("not found in tablebase");

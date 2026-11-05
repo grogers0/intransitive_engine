@@ -1,10 +1,10 @@
-use tablebase::{Tablebase, validation};
+use tablebase::{TablebaseMap, validation};
 
 fn main() {
     let opts = parse_command_line_args();
     init_threads(&opts);
-    let tablebase = Tablebase::new(&opts.tablebase_dir);
-    validation::validate_tablebase(&tablebase, opts.disable_dtm);
+    let tablebase_map = TablebaseMap::new(&opts.tablebase_dir);
+    validation::validate_tablebase(&tablebase_map, opts.disable_dtm);
 }
 
 struct Opts {

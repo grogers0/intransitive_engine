@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use std::time::Duration;
 
 use base::{Move, Position, Player, tt, history};
-use tablebase::Tablebase;
+use tablebase::TablebaseMap;
 
 const HASH_OPTION_PREFIX: &str = "setoption name Hash value ";
 
@@ -13,7 +13,7 @@ fn main() {
     let mut position = Position::initial();
     let mut tt = tt::TranspositionTable::new(tt::DEFAULT_TT_SIZE_MB);
     let mut history = history::HistoryTable::new();
-    let tablebase = Tablebase::new(&opts.tablebase_dir);
+    let tablebase_map = TablebaseMap::new(&opts.tablebase_dir);
     for line in io::stdin().lines().map(|line| line.unwrap()) {
         match line.as_str() {
             s if s.starts_with("setoption ") => {
@@ -38,7 +38,7 @@ fn main() {
                 let search_opts = parse_search_opts(position.active_player, &line);
                 tt.next_search();
                 let best_move = search::best_move(
-                    &mut position, &search_opts, &mut tt, &mut history, &tablebase);
+                    &mut position, &search_opts, &mut tt, &mut history, &tablebase_map);
                 println!("bestmove {}", best_move);
             },
             "rpsi" => {

@@ -6,7 +6,7 @@ use crate::{WDL, PieceCount, normalization, position_index};
 use base::{Value, Position, Player, Piece, MAX_PLY};
 use memmap2::Mmap;
 
-pub struct Tablebase {
+pub struct TablebaseMap {
     max_piece_total: u8,
     wdl: HashMap<PieceCount, Mmap>,
     dtz: HashMap<PieceCount, Mmap>,
@@ -30,7 +30,7 @@ fn filename_to_piece_count(filename: &str) -> PieceCount {
     piece_count
 }
 
-impl Tablebase {
+impl TablebaseMap {
     pub fn new(dir: &str) -> Self {
         let mut tb = Self {
             max_piece_total: 0,

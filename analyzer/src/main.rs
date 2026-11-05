@@ -3,7 +3,7 @@ use std::collections::{BinaryHeap, HashSet};
 use std::time::Duration;
 
 use base::{tt, history, Move, Value, Position};
-use tablebase::Tablebase;
+use tablebase::TablebaseMap;
 
 fn main() {
     let opts = parse_command_line_args();
@@ -17,12 +17,12 @@ fn main() {
     let top_n = 40;
     let mut tt = tt::TranspositionTable::new(opts.tt_size_mb);
     let mut history = history::HistoryTable::new();
-    let tablebase = Tablebase::new(&opts.tablebase_dir);
+    let tablebase_map = TablebaseMap::new(&opts.tablebase_dir);
     for fen_str in std::env::args().skip(1) {
         let mut position = Position::from_fen(&fen_str);
         tt.next_search();
         let move_values = search::evaluate_moves(
-            &mut position, &search_opts, &mut tt, &mut history, &tablebase);
+            &mut position, &search_opts, &mut tt, &mut history, &tablebase_map);
         let mut heap = BinaryHeap::new();
         #[derive(Eq, PartialEq)]
         struct HeapElem(Move, Value);
