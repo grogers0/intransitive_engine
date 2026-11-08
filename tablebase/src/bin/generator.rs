@@ -706,8 +706,6 @@ fn gen_tablebase(forward_piece_count: PieceCount, tablebase_map: &TablebaseMap, 
         });
     }
 
-    remove_checkpoint(&opts.tablebase_dir, forward_piece_count);
-
     let dest_filename = |piece_count: PieceCount, extension: &str| -> String {
         format!("{}/{}.tb{}", opts.tablebase_dir, tablebase_name(piece_count), extension)
     };
@@ -726,6 +724,8 @@ fn gen_tablebase(forward_piece_count: PieceCount, tablebase_map: &TablebaseMap, 
             fs::rename(wip_filename(piece_count, extension), dest_filename(piece_count, extension)).unwrap();
         }
     }
+
+    remove_checkpoint(&opts.tablebase_dir, forward_piece_count);
 }
 
 
