@@ -12,10 +12,8 @@ resolver = "3"
 lto = "thin"
 
 [profile.release-debug]
-inherits = "release"
-debug = true
-debug-assertions = true
-overflow-checks = true
+inherits = "dev"
+opt-level = 2
 
 [workspace.dependencies]
 base = { path = "base" }

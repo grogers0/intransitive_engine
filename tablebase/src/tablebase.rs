@@ -3,16 +3,33 @@ use std::fs;
 use std::io;
 use std::sync::atomic::{AtomicU8, AtomicU16, Ordering};
 
-use crate::{WDL, PieceCount, normalization, position_index};
+use crate::{WDL, PieceCount, normalization, position_index, tablebase_name};
 use base::{Value, Position, Player, Piece, MAX_PLY};
 use memmap2::{Mmap, MmapMut};
 use rayon::prelude::*;
 
-pub struct TablebaseMap {
+pub trait Tablebase: Send + Sync {
+    type Item;
+    fn get(&self, index: u64) -> Self::Item;
+    fn len(&self) -> u64;
+}
+
+pub trait WdlTablebase: Tablebase<Item = WDL> {}
+pub trait DtzTablebase: Tablebase<Item = u8> {}
+pub trait DtmTablebase: Tablebase<Item = u16> {}
+impl<T> WdlTablebase for T where T: Tablebase<Item = WDL> {}
+impl<T> DtzTablebase for T where T: Tablebase<Item = u8> {}
+impl<T> DtmTablebase for T where T: Tablebase<Item = u16> {}
+
+pub(crate) struct TablebasesForPieceCount<'a> {
+    pub(crate) wdl: WdlTablebaseMmap<'a>,
+    pub(crate) dtz: DtzTablebaseMmap<'a>,
+    pub(crate) dtm: Option<DtmTablebaseMmap<'a>>,
+}
+
+pub struct TablebaseMap<'a> {
     max_piece_total: u8,
-    wdl: HashMap<PieceCount, Mmap>,
-    dtz: HashMap<PieceCount, Mmap>,
-    dtm: HashMap<PieceCount, Mmap>,
+    pub(crate) by_piece_count: HashMap<PieceCount, TablebasesForPieceCount<'a>>,
 }
 
 fn filename_to_piece_count(filename: &str) -> PieceCount {
@@ -32,14 +49,9 @@ fn filename_to_piece_count(filename: &str) -> PieceCount {
     piece_count
 }
 
-impl TablebaseMap {
+impl TablebaseMap<'_> {
     pub fn new(dir: &str) -> Self {
-        let mut tb = Self {
-            max_piece_total: 0,
-            wdl: HashMap::new(),
-            dtz: HashMap::new(),
-            dtm: HashMap::new(),
-        };
+        let mut tb = Self { max_piece_total: 0, by_piece_count: HashMap::new() };
         tb.refresh(dir).unwrap();
         tb
     }
@@ -50,22 +62,18 @@ impl TablebaseMap {
             if path.is_dir() { continue; } // Ignore
             if let Some(filename) = path.file_name().and_then(|os_str| os_str.to_str()) {
                 let piece_count = filename_to_piece_count(filename);
-                let tablebase_map = if filename.ends_with(".tbwdl") {
-                    &mut self.wdl
-                } else if filename.ends_with(".tbdtz") {
-                    &mut self.dtz
-                } else if filename.ends_with(".tbdtm") {
-                    &mut self.dtm
-                } else {
-                    continue; // Skip unknown files
-                };
-                if tablebase_map.contains_key(&piece_count) {
+                if self.by_piece_count.contains_key(&piece_count) {
                     continue; // Already loaded
                 }
-                let file = fs::File::open(&path)?;
-                let mmap = unsafe { Mmap::map(&file)? };
-                tablebase_map.insert(piece_count, mmap);
-                self.max_piece_total = std::cmp::max(self.max_piece_total, piece_count.total()); 
+                let len = position_index::index_count(piece_count);
+
+                let tb_name = tablebase_name(piece_count);
+                let wdl = WdlTablebaseMmap::new(&format!("{}/{}.tbwdl", dir, tb_name), len)?;
+                let dtz = DtzTablebaseMmap::new(&format!("{}/{}.tbdtz", dir, tb_name), len)?;
+                let dtm = DtmTablebaseMmap::new(&format!("{}/{}.tbdtm", dir, tb_name), len).ok();
+                self.by_piece_count.insert(piece_count,
+                    TablebasesForPieceCount { wdl, dtz, dtm });
+                self.max_piece_total = std::cmp::max(self.max_piece_total, piece_count.total());
             }
         }
         Ok(())
@@ -129,31 +137,19 @@ impl TablebaseMap {
 
     // Raw APIs used by the generator, not intended to be used by search
     pub fn lookup_wdl_raw(&self, index: u64, piece_count: PieceCount) -> Option<WDL> {
-        self.wdl.get(&piece_count).map(|wdl_mmap| {
-            let byte_idx = (index as usize) >> 2;
-            let bit_idx = (index & 0x03) << 1;
-            match (wdl_mmap[byte_idx] >> bit_idx) & 0x03 {
-                0 => WDL::Loss,
-                1 => WDL::Draw,
-                2 => WDL::Win,
-                3 => panic!("malformed WDL file for piece count: {piece_count:?} contains unset field at index {index}"),
-                _ => unreachable!(),
-            }
+        self.by_piece_count.get(&piece_count).map(|tbs_for_piece_count| {
+            tbs_for_piece_count.wdl.get(index)
         })
     }
     pub fn lookup_dtz_raw(&self, index: u64, piece_count: PieceCount) -> Option<u8> {
-        self.dtz.get(&piece_count).map(|dtz_mmap| {
-            dtz_mmap[index as usize]
+        self.by_piece_count.get(&piece_count).map(|tbs_for_piece_count| {
+            tbs_for_piece_count.dtz.get(index)
         })
     }
     pub fn lookup_dtm_raw(&self, index: u64, piece_count: PieceCount) -> Option<u16> {
-        self.dtm.get(&piece_count).map(|dtm_mmap| {
-            let byte_idx = (index as usize) << 1;
-            u16::from_le_bytes(dtm_mmap.as_ref()[byte_idx..(byte_idx + 2)].try_into().unwrap())
+        self.by_piece_count.get(&piece_count).and_then(|tbs_for_piece_count| {
+            tbs_for_piece_count.dtm.as_ref().map(|dtm_tb| dtm_tb.get(index))
         })
-    }
-    pub fn get_covered_piece_counts(&self) -> Vec<PieceCount> {
-        self.wdl.keys().cloned().collect()
     }
 }
 
@@ -169,6 +165,15 @@ fn open_mmap_mut<'a, T>(filename: &str, len_bytes: u64) -> io::Result<(MmapMut, 
     let slice: &[T] = unsafe { std::slice::from_raw_parts(mmap.as_ptr() as *const T, len) };
     Ok((mmap, slice))
 }
+
+fn open_mmap<'a, T>(filename: &str) -> io::Result<(Mmap, &'a [T])> {
+    let file = fs::File::open(filename)?;
+    let mmap = unsafe { Mmap::map(&file)? };
+    let len = mmap.len() / std::mem::size_of::<T>();
+    let slice: &[T] = unsafe { std::slice::from_raw_parts(mmap.as_ptr() as *const T, len) };
+    Ok((mmap, slice))
+}
+
 
 fn par_memset(slice: &mut [u8], val: u8) {
     slice.par_chunks_mut(8 * 1024 * 1024).for_each(|chunk| chunk.fill(val));
@@ -188,10 +193,6 @@ impl <'a> WdlTablebaseMut<'a> {
 
     pub fn init(&mut self) {
         par_memset(&mut self.mmap, 0xff);
-    }
-
-    pub fn len(&self) -> u64 {
-        self.len
     }
 
     pub fn load(&self, index: u64, ordering: Ordering) -> Option<WDL> {
@@ -234,6 +235,56 @@ impl <'a> WdlTablebaseMut<'a> {
     }
 }
 
+impl Tablebase for WdlTablebaseMut<'_> {
+    type Item = WDL;
+
+    fn get(&self, index: u64) -> WDL {
+        self.load(index, Ordering::Relaxed).unwrap()
+    }
+
+    fn len(&self) -> u64 {
+        self.len
+    }
+}
+
+pub struct WdlTablebaseMmap<'a> {
+    _mmap: Mmap,
+    slice: &'a [u8],
+    len: u64,
+}
+
+impl WdlTablebaseMmap<'_> {
+    fn new(filename: &str, len: u64) -> io::Result<Self> {
+        let (mmap, slice) = open_mmap(filename)?;
+        assert_eq!(slice.len() as u64, (len + 3) / 4);
+        Ok(Self { _mmap: mmap, slice, len })
+    }
+}
+
+impl Tablebase for WdlTablebaseMmap<'_> {
+    type Item = WDL;
+
+    fn get(&self, index: u64) -> WDL {
+        debug_assert!(index < self.len);
+        let byte_offset = index >> 2;
+        let bit_offset = (index & 0x03) << 1;
+        let byte_val = *unsafe { self.slice.get_unchecked(byte_offset as usize) };
+        match (byte_val >> bit_offset) & 0x03 {
+            0 => WDL::Loss,
+            1 => WDL::Draw,
+            2 => WDL::Win,
+            3 => panic!(),
+            _ => unreachable!(),
+        }
+
+    }
+
+    fn len(&self) -> u64 {
+        self.len
+    }
+}
+
+
 pub struct DtzTablebaseMut<'a> {
     mmap: MmapMut,
     slice: &'a [AtomicU8],
@@ -247,10 +298,6 @@ impl <'a> DtzTablebaseMut<'a> {
 
     pub fn init(&mut self) {
         par_memset(&mut self.mmap, 0);
-    }
-
-    pub fn len(&self) -> u64 {
-        self.slice.len() as u64
     }
 
     pub fn load(&self, index: u64, ordering: Ordering) -> u8 {
@@ -275,6 +322,45 @@ impl <'a> DtzTablebaseMut<'a> {
     }
 }
 
+impl Tablebase for DtzTablebaseMut<'_> {
+    type Item = u8;
+
+    fn get(&self, index: u64) -> u8 {
+        self.load(index, Ordering::Relaxed)
+    }
+
+    fn len(&self) -> u64 {
+        self.slice.len() as u64
+    }
+}
+
+pub struct DtzTablebaseMmap<'a> {
+    _mmap: Mmap,
+    slice: &'a [u8],
+}
+
+impl DtzTablebaseMmap<'_> {
+    fn new(filename: &str, len: u64) -> io::Result<Self> {
+        let (mmap, slice) = open_mmap(filename)?;
+        assert_eq!(slice.len() as u64, len);
+        Ok(Self { _mmap: mmap, slice })
+    }
+}
+
+impl Tablebase for DtzTablebaseMmap<'_> {
+    type Item = u8;
+
+    fn get(&self, index: u64) -> u8 {
+        debug_assert!(index < self.len());
+        *unsafe { self.slice.get_unchecked(index as usize) }
+    }
+
+    fn len(&self) -> u64 {
+        self.slice.len() as u64
+    }
+}
+
+
 pub struct DtmTablebaseMut<'a> {
     mmap: MmapMut,
     slice: &'a [AtomicU16],
@@ -288,10 +374,6 @@ impl <'a> DtmTablebaseMut<'a> {
 
     pub fn init(&mut self) {
         par_memset(&mut self.mmap, 0);
-    }
-
-    pub fn len(&self) -> u64 {
-        self.slice.len() as u64
     }
 
     pub fn load(&self, index: u64, ordering: Ordering) -> u16 {
@@ -313,5 +395,43 @@ impl <'a> DtmTablebaseMut<'a> {
 
     pub fn flush(&mut self) -> io::Result<()> {
         self.mmap.flush()
+    }
+}
+
+impl Tablebase for DtmTablebaseMut<'_> {
+    type Item = u16;
+
+    fn get(&self, index: u64) -> u16 {
+        self.load(index, Ordering::Relaxed)
+    }
+
+    fn len(&self) -> u64 {
+        self.slice.len() as u64
+    }
+}
+
+pub struct DtmTablebaseMmap<'a> {
+    _mmap: Mmap,
+    slice: &'a [u16],
+}
+
+impl DtmTablebaseMmap<'_> {
+    fn new(filename: &str, len: u64) -> io::Result<Self> {
+        let (mmap, slice) = open_mmap(filename)?;
+        assert_eq!(slice.len() as u64, len);
+        Ok(Self { _mmap: mmap, slice })
+    }
+}
+
+impl Tablebase for DtmTablebaseMmap<'_> {
+    type Item = u16;
+
+    fn get(&self, index: u64) -> u16 {
+        debug_assert!(index < self.len());
+        *unsafe { self.slice.get_unchecked(index as usize) }
+    }
+
+    fn len(&self) -> u64 {
+        self.slice.len() as u64
     }
 }

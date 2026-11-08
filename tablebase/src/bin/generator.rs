@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
 use tablebase::{PieceCount, WDL, position_index, normalization, tablebase_name, TablebaseMap, validation, AtomicBitset};
-use tablebase::tablebase::{DtmTablebaseMut, WdlTablebaseMut, DtzTablebaseMut};
+use tablebase::tablebase::{DtmTablebaseMut, WdlTablebaseMut, DtzTablebaseMut, Tablebase};
 use base::{AdjacentLocs, Board, Cell, Outcome, Piece, Player, Position};
 
 struct Opts {
@@ -17,6 +17,7 @@ struct Opts {
     compressed_output: bool,
     num_threads: usize,
     checkpoint_interval: Duration,
+    validate: bool,
 }
 
 fn main() {
@@ -38,10 +39,6 @@ fn main() {
                     piece_count.players_flipped()));
         }
         tablebase_map.refresh(&opts.tablebase_dir).unwrap();
-    }
-
-    if cfg!(debug_assertions) {
-        validation::validate_tablebase(&tablebase_map, !opts.enable_dtm);
     }
 }
 
@@ -490,7 +487,7 @@ fn compute_dtm(forward_piece_count: PieceCount, inverse_piece_count: PieceCount,
                             opposite_queue.insert(after_backward_move_index);
                         });
                 } else if dtz_tb.load(before_move_index, Ordering::Relaxed) == 1 && wdl_tb.load(before_move_index, Ordering::Relaxed).unwrap() == WDL::Win {
-                    // When resuming, retry the win with dtz == 1 roots in case dtm hasn't been completed for that node
+                    // When resuming, retry the dtz == 1 roots in case dtm hasn't been completed for that node
                     queue.insert(before_move_index);
                 }
             });
@@ -686,7 +683,7 @@ fn gen_tablebase(forward_piece_count: PieceCount, tablebase_map: &TablebaseMap, 
 
         checkpoint = Some(Checkpoint { mode: CheckpointMode::Dtm, ply_threshold: 0 });
     }
-    if opts.enable_dtm {
+    let [forward_dtm_tb_opt, inverse_dtm_tb_opt] = if opts.enable_dtm {
         assert!(checkpoint.is_none() || checkpoint.unwrap().mode == CheckpointMode::Dtm);
 
         let mut forward_dtm_tb = DtmTablebaseMut::new(
@@ -701,8 +698,25 @@ fn gen_tablebase(forward_piece_count: PieceCount, tablebase_map: &TablebaseMap, 
             tablebase_map, completed_ply_threshold, opts);
 
         rayon::scope(|scope| {
-            scope.spawn(move |_| { forward_dtm_tb.flush().unwrap() });
-            scope.spawn(move |_| { inverse_dtm_tb.flush().unwrap() });
+            scope.spawn(|_| { forward_dtm_tb.flush().unwrap() });
+            scope.spawn(|_| { inverse_dtm_tb.flush().unwrap() });
+        });
+
+        [Some(forward_dtm_tb), Some(inverse_dtm_tb)]
+    } else {
+        [None, None]
+    };
+
+    if opts.validate {
+        rayon::scope(|scope| {
+            scope.spawn(|_|
+                validation::validate_tablebase(forward_piece_count, inverse_piece_count,
+                    &forward_wdl_tb, &forward_dtz_tb, forward_dtm_tb_opt.as_ref(),
+                    &inverse_wdl_tb, &inverse_dtz_tb, inverse_dtm_tb_opt.as_ref(), tablebase_map));
+            scope.spawn(|_|
+                validation::validate_tablebase(inverse_piece_count, forward_piece_count,
+                    &inverse_wdl_tb, &inverse_dtz_tb, inverse_dtm_tb_opt.as_ref(),
+                    &forward_wdl_tb, &forward_dtz_tb, forward_dtm_tb_opt.as_ref(), tablebase_map));
         });
     }
 
@@ -737,6 +751,7 @@ fn parse_command_line_args() -> Opts {
         compressed_output: false,
         num_threads: 0, // If 0, num_cpus is used
         checkpoint_interval: Duration::from_secs(60),
+        validate: cfg!(debug_assertions),
     };
 
     let mut args = std::env::args();
@@ -758,6 +773,12 @@ fn parse_command_line_args() -> Opts {
             },
             "--checkpoint_secs" | "--checkpoint-secs" => {
                 opts.checkpoint_interval = Duration::from_secs(args.next().unwrap().parse().unwrap());
+            },
+            "--validate" => {
+                opts.validate = true;
+            },
+            "--no-validate" | "--no_validate" => {
+                opts.validate = false;
             },
             _ => {
                 panic!("unknown command line argument \"{}\"", token);

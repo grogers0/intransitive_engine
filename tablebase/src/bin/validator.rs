@@ -4,7 +4,7 @@ fn main() {
     let opts = parse_command_line_args();
     init_threads(&opts);
     let tablebase_map = TablebaseMap::new(&opts.tablebase_dir);
-    validation::validate_tablebase(&tablebase_map, opts.disable_dtm);
+    validation::validate_tablebases(&tablebase_map, opts.disable_dtm);
 }
 
 struct Opts {

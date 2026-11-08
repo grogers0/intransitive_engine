@@ -27,7 +27,7 @@ struct State<'a> {
     pub soft_deadline: Option<Instant>,
     pub hard_deadline: Option<Instant>,
     pub tt: &'a mut tt::TranspositionTable,
-    pub tablebase_map: &'a TablebaseMap,
+    pub tablebase_map: &'a TablebaseMap<'a>,
     pub killers: Killers,
     pub history: &'a mut HistoryTable,
 }
