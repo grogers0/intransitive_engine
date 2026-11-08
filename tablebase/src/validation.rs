@@ -20,7 +20,8 @@ pub fn validate_tablebase(tablebase_map: &TablebaseMap, disable_dtm: bool) {
             let mut max_dtz = 0;
             let mut min_dtm = u16::MAX;
             let mut max_dtm = 0;
-            let mut dtm_disabled = disable_dtm;
+            let disable_dtm = disable_dtm || tablebase_map.lookup_dtm_raw(before_move_index, piece_count).is_none();
+
             for m in position.legal_moves().collect::<Vec<_>>() {
                 let undo_move = position.make_move(m);
                 match position.get_outcome() {
@@ -59,15 +60,13 @@ pub fn validate_tablebase(tablebase_map: &TablebaseMap, disable_dtm: bool) {
                             min_dtz = cmp::min(min_dtz, dtz);
                         }
 
-                        let dtm_opt = tablebase_map.lookup_dtm_raw(
-                                after_move_index, after_move_piece_count).map(|inner| inner + 1);
-                        if let Some(dtm) = dtm_opt {
+                        if !disable_dtm {
+                            let dtm = tablebase_map.lookup_dtm_raw(
+                                after_move_index, after_move_piece_count).unwrap() + 1;
                             max_dtm = cmp::max(max_dtm, dtm);
                             if wdl == WDL::Win {
                                 min_dtm = cmp::min(min_dtm, dtm);
                             }
-                        } else {
-                            dtm_disabled = true;
                         }
 
                         normalization::undo_normalize_position(&mut position, undo_normalize);
@@ -94,7 +93,7 @@ pub fn validate_tablebase(tablebase_map: &TablebaseMap, disable_dtm: bool) {
             };
             let tablebase_dtm = tablebase_map.lookup_dtm_raw(before_move_index, piece_count);
 
-            if computed_wdl != tablebase_wdl || computed_dtz != tablebase_dtz || (!dtm_disabled && Some(computed_dtm) != tablebase_dtm) {
+            if computed_wdl != tablebase_wdl || computed_dtz != tablebase_dtz || (!disable_dtm && computed_dtm != tablebase_dtm.unwrap()) {
                 num_failures.fetch_add(1, Ordering::Relaxed);
                 let mut guard = best_failure.lock().unwrap();
                 if guard.is_none() || computed_dtz < guard.as_ref().unwrap().0 {
@@ -107,7 +106,7 @@ pub fn validate_tablebase(tablebase_map: &TablebaseMap, disable_dtm: bool) {
                     if computed_dtz != tablebase_dtz {
                         writeln!(debug_message, "    computed_dtz ({computed_dtz}) != tablebase_dtz ({tablebase_dtz})").unwrap();
                     }
-                    if !dtm_disabled && Some(computed_dtm) != tablebase_dtm {
+                    if !disable_dtm && computed_dtm != tablebase_dtm.unwrap() {
                         writeln!(debug_message, "    computed_dtm ({computed_dtm}) != tablebase_dtm ({})", tablebase_dtm.unwrap()).unwrap();
                     }
 
