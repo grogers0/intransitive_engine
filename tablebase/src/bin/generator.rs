@@ -179,10 +179,12 @@ fn iter_backward_move_indexes<F: Fn(u64) -> ()>(piece_count: PieceCount, inverse
     }
 }
 
-fn initialize_roots<'a>(piece_count: PieceCount, wdl_tb: &'a WdlTablebaseMut, queue: &'a AtomicBitset, scope: &rayon::Scope<'a>) {
+fn initialize_roots<'a, F: Fn(u64) -> () + Sync + Send + 'a>(piece_count: PieceCount, queue: &'a AtomicBitset,
+    scope: &rayon::Scope<'a>, handle_losses_in_zero: F) {
+    let len = position_index::index_count(piece_count);
     scope.spawn(move |_| {
         // TODO - handle moves that win in 1 by blocking all moves in a more efficient way
-        (0..wdl_tb.len()).into_par_iter().for_each(|before_move_index| {
+        (0..len).into_par_iter().for_each(|before_move_index| {
             let mut position = Position::from_board_and_player(
                 position_index::index_to_board(before_move_index as u64, piece_count), Player::Blue);
             // Handle board where blue can't make any legal moves
@@ -190,8 +192,7 @@ fn initialize_roots<'a>(piece_count: PieceCount, wdl_tb: &'a WdlTablebaseMut, qu
                 None => (),
                 Some(Outcome::Win(Player::Blue)) | Some(Outcome::Draw) => unreachable!(),
                 Some(Outcome::Win(Player::Red)) => {
-                    wdl_tb.store(before_move_index, WDL::Loss, Ordering::Relaxed);
-                    // dtz/dtm is already 0 so no need to update it
+                    handle_losses_in_zero(before_move_index);
                     return;
                 }
             }
@@ -310,9 +311,15 @@ fn compute_wdl_and_dtz(forward_piece_count: PieceCount, inverse_piece_count: Pie
         });
 
         rayon::scope(|scope| {
-            scope.spawn(|scope|
-                initialize_roots(forward_piece_count, forward_wdl_tb, &forward_queue, scope));
-            initialize_roots(inverse_piece_count, inverse_wdl_tb, &inverse_queue, scope);
+            // NOTE - dtz/dtm start at 0 so no need to update them for losses in 0
+            scope.spawn(|scope| {
+                initialize_roots(forward_piece_count, &forward_queue, scope,
+                    |index| { forward_wdl_tb.store(index, WDL::Loss, Ordering::Relaxed) });
+            });
+            scope.spawn(|scope| {
+                initialize_roots(inverse_piece_count, &inverse_queue, scope,
+                    |index| { inverse_wdl_tb.store(index, WDL::Loss, Ordering::Relaxed) });
+            });
         });
     }
 
@@ -497,50 +504,15 @@ fn compute_dtm(forward_piece_count: PieceCount, inverse_piece_count: PieceCount,
             scope.spawn(|_| forward_dtm_tb.init());
             scope.spawn(|_| inverse_dtm_tb.init());
         });
-        [false, true].into_par_iter().with_max_len(1).for_each(|is_inverse| {
-            let (wdl_tb, dtz_tb, dtm_tb, piece_count, opposite_piece_count, opposite_queue, queue) = if is_inverse {
-                (&*inverse_wdl_tb, &*inverse_dtz_tb, &*inverse_dtm_tb, inverse_piece_count, forward_piece_count, &forward_queue, &inverse_queue)
-            } else {
-                (&*forward_wdl_tb, &*forward_dtz_tb, &*forward_dtm_tb, forward_piece_count, inverse_piece_count, &inverse_queue, &forward_queue)
-            };
-
-            // All wins or losses in 1 dtz are roots for the dtm search. This is slower than
-            // re-enumerating the roots but saves code complexity. We don't need to explicitly
-            // handle DTM=0 wins or losses since the DTM is initialized to 0, and we handle any
-            // DTM=1 cases to propagate backwards.
-            (0..wdl_tb.len()).into_par_iter().for_each(|before_move_index| {
-                if dtz_tb.load(before_move_index, Ordering::Relaxed) == 1 && wdl_tb.load(before_move_index, Ordering::Relaxed).unwrap() != WDL::Draw {
-                    let mut position = Position::from_board_and_player(
-                        position_index::index_to_board(before_move_index as u64, piece_count), Player::Blue);
-                    for m in position.legal_moves().collect::<Vec<_>>() {
-                        let undo_move = position.make_move(m);
-                        let outcome = position.get_outcome();
-                        position.undo_move(undo_move);
-
-                        match outcome {
-                            Some(Outcome::Win(Player::Blue)) => {
-                                dtm_tb.store(before_move_index, 1, Ordering::Relaxed);
-                                iter_backward_move_indexes(piece_count, opposite_piece_count, &mut position.board,
-                                    |after_backward_move_index| {
-                                        opposite_queue.insert(after_backward_move_index);
-                                    });
-                                return;
-                            },
-                            Some(Outcome::Win(Player::Red)) => unreachable!(),
-                            Some(Outcome::Draw) => unreachable!(),
-                            None => (),
-                        }
-                    }
-                    // Must sit in the queue until dtm == ply_threshold or a
-                    // faster path is found
-                    queue.insert(before_move_index);
-                }
-            });
+        rayon::scope(|scope| {
+            // NOTE - dtm is initialized to 0 so we don't need to handle losses in 0 from no moves
+            scope.spawn(|scope| initialize_roots(forward_piece_count, &forward_queue, scope, |_| {}));
+            scope.spawn(|scope| initialize_roots(inverse_piece_count, &inverse_queue, scope, |_| {}));
         });
     }
 
     let mut made_progress = true;
-    let mut ply_threshold = if completed_ply_threshold == 0 { 2 } else { completed_ply_threshold + 1 };
+    let mut ply_threshold = completed_ply_threshold + 1;
     while made_progress {
         made_progress = [false, true].into_par_iter().with_max_len(1).map(|is_inverse| {
             let (wdl_tb, dtm_tb, opposite_wdl_tb, opposite_dtm_tb, piece_count, opposite_piece_count, queue, opposite_queue) = if is_inverse {
@@ -564,7 +536,10 @@ fn compute_dtm(forward_piece_count: PieceCount, inverse_piece_count: PieceCount,
                 for m in position.legal_moves().collect::<Vec<_>>() {
                     let undo_move = position.make_move(m);
                     match position.get_outcome() {
-                        Some(Outcome::Win(Player::Blue)) => unreachable!(), // calculated already
+                        Some(Outcome::Win(Player::Blue)) => {
+                            max_dtm = cmp::max(max_dtm, 1);
+                            min_dtm = cmp::min(min_dtm, 1);
+                        },
                         Some(Outcome::Win(Player::Red)) => unreachable!(),
                         Some(Outcome::Draw) => unreachable!(),
                         None => {
