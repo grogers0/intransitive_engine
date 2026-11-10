@@ -179,44 +179,63 @@ fn iter_backward_move_indexes<F: Fn(u64) -> ()>(piece_count: PieceCount, inverse
     }
 }
 
-fn initialize_roots<'a, F: Fn(u64) -> () + Sync + Send + 'a>(piece_count: PieceCount, queue: &'a AtomicBitset,
-    scope: &rayon::Scope<'a>, handle_losses_in_zero: F) {
-    let len = position_index::index_count(piece_count);
-    scope.spawn(move |_| {
-        // TODO - handle moves that win in 1 by blocking all moves in a more efficient way
-        (0..len).into_par_iter().for_each(|before_move_index| {
-            let mut position = Position::from_board_and_player(
-                position_index::index_to_board(before_move_index as u64, piece_count), Player::Blue);
-            // Handle board where blue can't make any legal moves
-            match position.get_outcome() {
-                None => (),
-                Some(Outcome::Win(Player::Blue)) | Some(Outcome::Draw) => unreachable!(),
-                Some(Outcome::Win(Player::Red)) => {
-                    handle_losses_in_zero(before_move_index);
-                    return;
-                }
-            }
-            // Handle wins in 1 move that aren't explicitly covered below
-            let legal_moves = position.legal_moves()
-                .filter(|m| !m.is_capture)
-                .filter(|m| (m.to_x, m.to_y) != Position::corner_goal(Player::Blue))
-                .collect::<Vec<_>>();
-            for m in legal_moves {
-                let undo_move = position.make_move(m);
-                let outcome = position.get_outcome();
-                position.undo_move(undo_move);
+fn initialize_single_corner_surround_roots<'a, F: Fn(u64) -> ()>(piece_count: PieceCount, opposite_piece_count: PieceCount, opposite_queue: &'a AtomicBitset, handle_losses_in_zero: F) {
+    if piece_count.total_for_player(Player::Blue) > 1 || piece_count.total_for_player(Player::Red) < 3 {
+        return;
+    }
 
-                match outcome {
-                    Some(Outcome::Win(Player::Blue)) => {
-                        queue.insert(before_move_index);
-                        break;
-                    },
-                    Some(Outcome::Win(Player::Red)) => unreachable!(),
-                    Some(Outcome::Draw) => unreachable!(),
-                    None => (),
-                }
+    fn recur<F: Fn(u64) -> ()>(blue_piece: Piece, board: &mut Board, remaining_piece_count: &mut PieceCount, adjacent_locs: &[(u8, u8)],
+        piece_count: PieceCount, opposite_piece_count: PieceCount, opposite_queue: &AtomicBitset, handle_losses_in_zero: &F) {
+        if adjacent_locs.is_empty() {
+            iter_all_boards(*remaining_piece_count, board, |board| {
+                let before_move_index = position_index::board_to_index(board, piece_count);
+                handle_losses_in_zero(before_move_index);
+                iter_backward_move_indexes(piece_count, opposite_piece_count, board,
+                    |after_backward_move_index| {
+                        opposite_queue.insert(after_backward_move_index);
+                    });
+            });
+        } else {
+            let (x, y) = adjacent_locs[0];
+            let adjacent_locs = &adjacent_locs[1..];
+            for piece in Piece::iter() {
+                if remaining_piece_count.get(Player::Red, piece) == 0 { continue; }
+                if blue_piece.can_capture(piece) { continue; }
+
+                *remaining_piece_count.get_mut(Player::Red, piece) -= 1;
+                *board.get_mut(x, y) = Cell::Occupied(Player::Red, piece);
+
+                recur(blue_piece, board, remaining_piece_count, adjacent_locs, piece_count,
+                    opposite_piece_count, opposite_queue, handle_losses_in_zero);
+
+                *board.get_mut(x, y) = Cell::Empty;
+                *remaining_piece_count.get_mut(Player::Red, piece) += 1;
             }
-        });
+        }
+    }
+
+    let blue_piece = Piece::iter().filter(|&piece| piece_count.get(Player::Blue, piece) > 0).next().unwrap();
+    let mut remaining_piece_count = piece_count - PieceCount::single(Player::Blue, blue_piece);
+    let mut board = Board::new();
+    for (blue_x, blue_y) in [(0, 0), (8, 0), (0, 8)] {
+        *board.get_mut(blue_x, blue_y) = Cell::Occupied(Player::Blue, blue_piece);
+        recur(blue_piece, &mut board, &mut remaining_piece_count, &AdjacentLocs::new(blue_x, blue_y).collect::<Vec<_>>(),
+        piece_count, opposite_piece_count, opposite_queue, &handle_losses_in_zero);
+
+        *board.get_mut(blue_x, blue_y) = Cell::Empty;
+    }
+}
+
+
+fn initialize_roots<'a, F: Fn(u64) -> () + Sync + Send + 'a>(piece_count: PieceCount, opposite_piece_count: PieceCount,
+    queue: &'a AtomicBitset, opposite_queue: &'a AtomicBitset, scope: &rayon::Scope<'a>, handle_losses_in_zero: F) {
+    scope.spawn(move |_| {
+        // Being unable to move is a loss in zero
+        initialize_single_corner_surround_roots(
+            piece_count, opposite_piece_count, opposite_queue, handle_losses_in_zero);
+        // NOTE - would need extra logic for 6+ piece tablebases
+        // Single edge would need 1 blue + at least 5 red
+        // Single corner + edge would need 2 blue + at least 4 red
     });
 
     scope.spawn(move |_| {
@@ -304,20 +323,17 @@ fn compute_wdl_and_dtz(forward_piece_count: PieceCount, inverse_piece_count: Pie
         });
     } else {
         rayon::scope(|scope| {
-            scope.spawn(|_| forward_wdl_tb.init());
             scope.spawn(|_| forward_dtz_tb.init());
-            scope.spawn(|_| inverse_wdl_tb.init());
             scope.spawn(|_| inverse_dtz_tb.init());
-        });
-
-        rayon::scope(|scope| {
             // NOTE - dtz/dtm start at 0 so no need to update them for losses in 0
             scope.spawn(|scope| {
-                initialize_roots(forward_piece_count, &forward_queue, scope,
+                forward_wdl_tb.init();
+                initialize_roots(forward_piece_count, inverse_piece_count, &forward_queue, &inverse_queue, scope,
                     |index| { forward_wdl_tb.store(index, WDL::Loss, Ordering::Relaxed) });
             });
             scope.spawn(|scope| {
-                initialize_roots(inverse_piece_count, &inverse_queue, scope,
+                inverse_wdl_tb.init();
+                initialize_roots(inverse_piece_count, forward_piece_count, &inverse_queue, &forward_queue, scope,
                     |index| { inverse_wdl_tb.store(index, WDL::Loss, Ordering::Relaxed) });
             });
         });
@@ -503,11 +519,11 @@ fn compute_dtm(forward_piece_count: PieceCount, inverse_piece_count: PieceCount,
         rayon::scope(|scope| {
             scope.spawn(|_| forward_dtm_tb.init());
             scope.spawn(|_| inverse_dtm_tb.init());
-        });
-        rayon::scope(|scope| {
             // NOTE - dtm is initialized to 0 so we don't need to handle losses in 0 from no moves
-            scope.spawn(|scope| initialize_roots(forward_piece_count, &forward_queue, scope, |_| {}));
-            scope.spawn(|scope| initialize_roots(inverse_piece_count, &inverse_queue, scope, |_| {}));
+            scope.spawn(|scope| initialize_roots(
+                    forward_piece_count, inverse_piece_count, &forward_queue, &inverse_queue, scope, |_| {}));
+            scope.spawn(|scope| initialize_roots(
+                    inverse_piece_count, forward_piece_count, &inverse_queue, &forward_queue, scope, |_| {}));
         });
     }
 
